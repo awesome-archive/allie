@@ -25,18 +25,16 @@
 #include <QWaitCondition>
 
 #include "game.h"
+#include "node.h"
 
-namespace lczero {
-    class Network;
-    class NetworkComputation;
-};
+#include "neural/network.h"
 
-class Node;
 class Computation {
 public:
-    Computation(lczero::Network *network = nullptr);
+    Computation(QSharedPointer<lczero::Network> network);
     ~Computation();
 
+    void reset();
     int addPositionToEvaluate(const Node *node);
     int positions() const { return m_positions; }
     void evaluate();
@@ -46,10 +44,10 @@ public:
     void setPVals(int index, Node *node) const;
 
 private:
-    bool m_acquired;
     int m_positions;
-    lczero::Network *m_network;
+    QSharedPointer<lczero::Network> m_network;
     lczero::NetworkComputation *m_computation;
+    std::vector<lczero::InputPlane> m_inputPlanes;
 };
 
 class NeuralNet {
@@ -58,18 +56,20 @@ public:
 
     void reset();
     void setWeights(const QString &pathToWeights);
-    lczero::Network *acquireNetwork(); // will block until a network is ready
-    void releaseNetwork(lczero::Network *network); // must be called when you are done
+    Computation *acquireNetwork(); // will block until a network is ready
+    void releaseNetwork(Computation*); // must be called when you are done
 
 private:
     NeuralNet();
     ~NeuralNet();
-    lczero::Network *createNewNetwork(int id, bool fp16) const;
-    QVector<lczero::Network*> m_availableNetworks;
+    lczero::Network *createNewGPUNetwork(int id, bool fp16, bool useCustomWinograd) const;
+
+    QVector<Computation*> m_availableNetworks;
     QMutex m_mutex;
     QWaitCondition m_condition;
     bool m_weightsValid;
     bool m_usingFP16;
+    bool m_usingCustomWinograd;
     friend class Computation;
     friend class MyNeuralNet;
 };

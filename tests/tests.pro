@@ -22,17 +22,22 @@ DEFINES += QT_DEPRECATED_WARNINGS
 INCLUDEPATH += $$PWD/../lib
 
 HEADERS += \
-    testgames.h
+    tests.h \
     $$PWD/../lib/version.h
 
 SOURCES += \
     main.cpp \
-    testgames.cpp
+    testbasics.cpp \
+    testgames.cpp \
+    testcache.cpp \
+    testmath.cpp \
+    tests.cpp
 
 win32 {
     PRE_TARGETDEPS += $$PWD/../lib $$DESTDIR/margean.lib
 } else {
     PRE_TARGETDEPS += $$PWD/../lib $$DESTDIR/libmargean.a
+    QMAKE_CXXFLAGS += -march=native -ffast-math
 }
 
 LIBS += -L$$OUT_PWD/../bin -lmargean

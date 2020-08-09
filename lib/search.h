@@ -27,7 +27,7 @@
 #include "game.h"
 
 struct Search {
-    QVector<Move> searchMoves;
+    QVector<QString> searchMoves;
     qint64 wtime = -1;
     qint64 btime = -1;
     qint64 winc = -1;
@@ -38,48 +38,76 @@ struct Search {
     qint64 mate = -1;
     qint64 movetime = -1;
     bool infinite = false;
-    Game game;
+};
+
+struct SearchSettings {
+    enum Feature {
+        None = 0x0,
+        Threading = 0x1,
+        EarlyExit = 0x2,
+        Transpositions = 0x4,
+        Minimax = 0x8,
+        TreeReuse = 0x10
+    };
+    Q_DECLARE_FLAGS(Features, Feature)
+
+    static float cpuctF;
+    static float cpuctInit;
+    static float cpuctBase;
+    static float fpuReduction;
+    static float policySoftmaxTemp;
+    static float policySoftmaxTempInverse;
+    static float openingTimeFactor;
+    static float earlyExitFactor;
+    static int tryPlayoutLimit;
+    static int vldMax;
+    static QString weightsFile;
+    static bool debugInfo;
+    static bool chess960;
+    static Features featuresOff;
+
+    static Features stringToFeatures(const QString&);
+    static QString featuresToString(Features f);
 };
 
 QDebug operator<<(QDebug, const Search &);
 
-enum Trend {
-    Worse = 0,
-    Better
-};
-
-QString trendToString(Trend t);
-
 struct WorkerInfo {
-    int sumDepths = 0;
-    int maxDepth = 0;
-    int nodesSearched = 0;
-    int nodesSearchedTotal = 0;
-    int nodesEvaluated = 0;
-    int nodesCreated = 0;
-    int numberOfBatches = 0;
-    int nodesCacheHits = 0;
-    int nodesTBHits = 0;
+    quint32 sumDepths = 0;
+    quint32 maxDepth = 0;
+    quint64 nodesSearched = 0;
+    quint64 nodesEvaluated = 0;
+    quint64 nodesVisited = 0;
+    quint32 numberOfBatches = 0;
+    quint64 nodesCacheHits = 0;
+    quint64 nodesTBHits = 0;
+    quint32 searchId = 0;
+    bool hasTarget = false;
+    bool targetReached = false;
     QString threadId;
 };
 
 struct SearchInfo {
-    int depth = -1;
-    int seldepth = -1;
-    qint64 time = -1;
-    int nodes = -1;
+    quint32 depth = 0;
+    quint32 seldepth = 0;
+    qint64 time = 0;
+    quint64 nodes = 0;
     QString score;
-    int nps = -1;
-    int batchSize = -1;
+    quint32 nps = 0;
+    quint32 batchSize = 0;
     QString pv;
-    int rawnps = -1;
-    Trend trend = Better;
-    float trendDegree = 0.0;
+    quint32 rawnps = 0;
+    quint32 nnnps = 0;
     QString bestMove;
     QString ponderMove;
     bool isResume = false;
     bool isDTZ = false;
+    bool bestIsMostVisited = true;
     WorkerInfo workerInfo;
+    quint32 games = 0;
+
+    void calculateSpeeds(qint64 time);
+    static SearchInfo nodeAndBatchDiff(const SearchInfo &a, const SearchInfo &b);
 };
 
 #endif // SEARCH_H

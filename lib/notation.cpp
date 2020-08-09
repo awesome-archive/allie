@@ -21,10 +21,12 @@
 #include "notation.h"
 
 #include "move.h"
+#include "options.h"
 #include "square.h"
 
 #include <QVector>
 #include <QDebug>
+#include <QStringBuilder>
 
 using namespace Chess;
 
@@ -143,7 +145,6 @@ Move Notation::stringToMove(const QString &string, Chess::NotationType notation,
 QString Notation::moveToString(const Move &move, Chess::NotationType notation)
 {
     QString str;
-
     switch (notation) {
     case Standard:
         {
@@ -189,21 +190,37 @@ QString Notation::moveToString(const Move &move, Chess::NotationType notation)
             QChar piece = pieceToChar(move.piece(), notation);
             QChar sep = move.isCapture() ? 'x' : '-';
             QString start = squareToString(move.start(), notation);
-            QString end = squareToString(move.end(), notation);
+
+            int e = move.end().file();
+            // All castles are encoded as king captures rook internally which is correct for 960,
+            // but not for normal
+            if (move.isCastle() && !SearchSettings::chess960)
+                e = e == 7 ? 6 : 2;
+
+            QString end = squareToString(Square(e, move.end().rank()), notation);
             if (!piece.isNull())
                 str += piece;
 
             str += start;
             str += sep;
             str += end;
+
             break;
         }
     case Computer:
         {
             QString start = squareToString(move.start(), notation);
-            QString end = squareToString(move.end(), notation);
+
+            int e = move.end().file();
+            // All castles are encoded as king captures rook internally which is correct for 960,
+            // but not for normal
+            if (move.isCastle() && !SearchSettings::chess960)
+                e = e == 7 ? 6 : 2;
+
+            QString end = squareToString(Square(e, move.end().rank()), notation);
             str += start;
             str += end;
+
             if (move.promotion() != Unknown)
                 str += pieceToChar(move.promotion(), notation).toLower();
         break;
@@ -237,24 +254,12 @@ Square Notation::stringToSquare(const QString &string, Chess::NotationType notat
     return Square(file, rank);
 }
 
-QString Notation::squareToString(const Square &square, Chess::NotationType notation)
+QString Notation::squareToString(const Square &square, Chess::NotationType)
 {
     if (!square.isValid())
         return QString();
 
-    QString str;
-
-    switch (notation) {
-    case Standard:
-    case Long:
-    case Computer:
-        {
-            str = QString("%1%2").arg(fileToChar(square.file())).arg(rankToChar(square.rank()));
-            break;
-        }
-    }
-
-    return str;
+    return QString(fileToChar(square.file()) % rankToChar(square.rank()));
 }
 
 Chess::PieceType Notation::charToPiece(const QChar &ch, Chess::NotationType notation, bool *ok, QString *err)
@@ -263,8 +268,7 @@ Chess::PieceType Notation::charToPiece(const QChar &ch, Chess::NotationType nota
     Q_UNUSED(err);
     PieceType piece = Chess::Unknown;
 
-    QVector<QChar> pieces;
-    pieces << 'U' << 'K' << 'Q' << 'R' << 'B' << 'N' << 'P';
+    static QVector<QChar> pieces = {'U', 'K', 'Q', 'R', 'B', 'N', 'P'};
 
     switch (notation) {
     case Standard:
@@ -287,8 +291,7 @@ QChar Notation::pieceToChar(Chess::PieceType piece, Chess::NotationType notation
 {
     QChar ch;
 
-    QVector<QChar> pieces;
-    pieces << 'U' << 'K' << 'Q' << 'R' << 'B' << 'N' << 'P';
+    static QVector<QChar> pieces = {'U', 'K', 'Q', 'R', 'B', 'N', 'P'};
 
     switch (notation) {
     case Standard:
@@ -309,8 +312,7 @@ int Notation::charToFile(const QChar &ch, Chess::NotationType notation, bool *ok
 {
     int file = 0;
 
-    QVector<QChar> files;
-    files << 'a' << 'b' << 'c' << 'd' << 'e' << 'f' << 'g' << 'h';
+    static QVector<QChar> files = {'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h'};
 
     switch (notation) {
     case Standard:
@@ -339,8 +341,7 @@ QChar Notation::fileToChar(int file, Chess::NotationType notation)
                "Notation::fileToChar(int file, ...) range error",
                QString("%1").arg(QString::number(file)).toLatin1().constData());
 
-    QVector<QChar> files;
-    files << 'a' << 'b' << 'c' << 'd' << 'e' << 'f' << 'g' << 'h';
+    static QVector<QChar> files = {'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h'};
 
     switch (notation) {
     case Standard:
@@ -359,8 +360,7 @@ int Notation::charToRank(const QChar &ch, Chess::NotationType notation, bool *ok
 {
     int rank = 0;
 
-    QVector<QChar> ranks;
-    ranks << '1' << '2' << '3' << '4' << '5' << '6' << '7' << '8';
+    static QVector<QChar> ranks = {'1', '2', '3', '4', '5', '6', '7', '8'};
 
     switch (notation) {
     case Standard:
@@ -385,8 +385,7 @@ QChar Notation::rankToChar(int rank, Chess::NotationType notation)
 {
     QChar ch;
 
-    QVector<QChar> ranks;
-    ranks << '1' << '2' << '3' << '4' << '5' << '6' << '7' << '8';
+    static QVector<QChar> ranks = {'1', '2', '3', '4', '5', '6', '7', '8'};
 
     switch (notation) {
     case Standard:

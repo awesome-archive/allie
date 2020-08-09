@@ -41,7 +41,9 @@ public:
     qint64 increment(Chess::Army army) const;
     void setIncrement(Chess::Army army, qint64 inc);
 
+    bool isMoveTime() const;
     void setMoveTime(qint64 time);
+    bool isInfinite() const;
     void setInfinite(bool infinite);
 
     void startDeadline(Chess::Army army);
@@ -51,7 +53,9 @@ public:
     bool hasExpired() const;
     qint64 deadline() const { return m_deadline; }
     qint64 timeToDeadline() const;
-    qint64 trendFactor() const;
+
+    float extraBudgetedTime() const { return m_extraBudgetedTime; }
+    void setExtraBudgetedTime(float t) { m_extraBudgetedTime = t; }
 
     void setMaterialScore(int score) { m_materialScore = score; }
     void setHalfMoveNumber(int half) { m_halfMoveNumber = half; }
@@ -60,10 +64,16 @@ public:
     bool pastMoveOverhead() const;
 
     bool isActive() const { return m_isActive; }
-    void stop() { m_isActive = false; m_timeout->stop(); }
+    void stop();
+
+    bool isExtended() const { return m_isExtended; }
+    void resetExtension() { m_isExtended = false; }
 
 Q_SIGNALS:
     void timeout();
+
+private Q_SLOTS:
+    void maybeTimeout();
 
 private:
     int expectedHalfMovesTillEOG() const;
@@ -78,11 +88,12 @@ private:
     qint64 m_blackIncrement;
 
     qint64 m_moveTime;
+    float m_extraBudgetedTime;
     bool m_infinite;
+    bool m_isExtended;
 
     SearchInfo m_info;
     qint64 m_deadline;
-    qint64 m_trendFactor;
     int m_materialScore;
     int m_halfMoveNumber;
     Chess::Army m_onTheClock;

@@ -30,10 +30,10 @@
 
 #include <iostream>
 
+#include "cache.h"
 #include "chess.h"
 #include "clock.h"
 #include "game.h"
-#include "hash.h"
 #include "history.h"
 #include "nn.h"
 #include "notation.h"
@@ -41,11 +41,7 @@
 #include "searchengine.h"
 #include "tb.h"
 
-#define LOG
-//#define AVERAGES
-#if defined(LOG)
 static bool s_firstLog = true;
-#endif
 
 //#define DEBUG_TIME
 
@@ -58,7 +54,8 @@ UciOption::UciOption()
       m_min(QString()),
       m_max(QString()),
       m_var(QVector<QString>()),
-      m_value(QString())
+      m_value(QString()),
+      m_valueType(QString())
 {
 }
 
@@ -69,13 +66,13 @@ QString UciOption::toString() const {
     case Check:
         {
             list << "check";
-            list << "default" << m_default;
+            list << "default" << m_value;
             break;
         }
     case Spin:
         {
             list << "spin";
-            list << "default" << m_default;
+            list << "default" << m_value;
             list << "min" << m_min;
             list << "max" << m_max;
 
@@ -84,7 +81,7 @@ QString UciOption::toString() const {
     case Combo:
         {
             list << "combo";
-            list << "default" << m_default;
+            list << "default" << m_value;
             for (QString v : m_var) {
                 list << "var" << v;
             }
@@ -98,7 +95,7 @@ QString UciOption::toString() const {
     case String:
         {
             list << "string";
-            list << "default" << m_default;
+            list << "default" << m_value;
             break;
         }
     }
@@ -114,12 +111,12 @@ QCommandLineOption UciOption::commandLine() const
 {
     QString desc;
     if (!m_min.isEmpty() && !m_max.isEmpty())
-        desc = QString("%0 (min:%1, max:%2, default:%3)").arg(m_description).arg(m_min).arg(m_max).arg(m_default);
+        desc = QString("%0\n [MIN:%1, MAX:%2, DEFAULT:%3]\n").arg(m_description).arg(m_min).arg(m_max).arg(m_default);
     else if (!m_var.isEmpty())
-        desc = QString("%0 (%1, default:%2)").arg(m_description).arg(m_var.toList().join(", ")).arg(m_default);
+        desc = QString("%0\n [%1, DEFAULT:%2]\n").arg(m_description).arg(m_var.toList().join(", ")).arg(m_default);
     else
-        desc = QString("%0 (default:%1)").arg(m_description).arg(m_default);
-    return QCommandLineOption(toCamelCase(m_name), desc, "value", m_default);
+        desc = QString("%0\n [DEFAULT:%1]\n").arg(m_description).arg(m_default);
+    return QCommandLineOption(toCamelCase(m_name), desc, m_valueType, m_default);
 }
 
 void UciOption::setFromCommandLine(const QCommandLineOption &line)
@@ -161,23 +158,24 @@ void g_uciMessageHandler(QtMsgType type, const QMessageLogContext &context, cons
         fprintf(stderr, "%s", format.toLatin1().constData());
     }
 
-#if defined(LOG)
-    QString logFilePath = QCoreApplication::applicationDirPath() +
-        QDir::separator() + QCoreApplication::applicationName() +
-        "_debug.log";
-    QFile file(logFilePath);
+    const bool debugLog = Options::globalInstance()->option("DebugLog").value() == "true";
+    if (debugLog) {
+        QString logFilePath = QCoreApplication::applicationDirPath() +
+            QDir::separator() + QCoreApplication::applicationName() +
+            "_debug.log";
+        QFile file(logFilePath);
 
-    QIODevice::OpenMode mode = QIODevice::WriteOnly | QIODevice::Text | QIODevice::Append;
-    if (!file.open(mode))
-        return;
+        QIODevice::OpenMode mode = QIODevice::WriteOnly | QIODevice::Text | QIODevice::Append;
+        if (!file.open(mode))
+            return;
 
-    QTextStream log(&file);
-    if (s_firstLog)
-        log << "Output: log pid " << QCoreApplication::applicationPid() << " at "
-            << QDateTime::currentDateTime().toString() << "\n";
-    log << format;
-    s_firstLog = false;
-#endif
+        QTextStream log(&file);
+        if (s_firstLog)
+            log << "Output: log pid " << QCoreApplication::applicationPid() << " at "
+                << QDateTime::currentDateTime().toString() << "\n";
+        log << format;
+        s_firstLog = false;
+    }
 }
 
 IOWorker::IOWorker(const QString &debugFile, QObject *parent)
@@ -261,19 +259,19 @@ void IOWorker::readyReadOutput(const QString &output)
 
 UciEngine::UciEngine(QObject *parent, const QString &debugFile)
     : QObject(parent),
-    m_debug(false),
+    m_averageInfoN(0),
+    m_minBatchesForAverage(0),
     m_gameInitialized(false),
+    m_pendingBestMove(false),
     m_debugFile(debugFile),
     m_searchEngine(nullptr),
-    m_timeAtLastProgress(0),
-    m_depthTargeted(-1),
-    m_nodesTargeted(-1),
     m_clock(new Clock(this)),
     m_ioHandler(nullptr)
 {
     m_searchEngine = new SearchEngine(this);
     connect(m_searchEngine, &SearchEngine::sendInfo, this, &UciEngine::sendInfo);
-    connect(m_clock, &Clock::timeout, this, [&](){ sendBestMove(false /*force*/); });
+    connect(m_searchEngine, &SearchEngine::requestStop, this, &UciEngine::stopRequested);
+    connect(m_clock, &Clock::timeout, this, &UciEngine::sendBestMove);
 }
 
 UciEngine::~UciEngine()
@@ -294,11 +292,11 @@ void UciEngine::readyRead(const QString &line)
         QList<QString> debug = line.split(' ');
         if (debug.count() == 2) {
             if (debug.at(1) == "on")
-                m_debug = true;
+                SearchSettings::debugInfo = true;
             else if (debug.at(1) == "off")
-                m_debug = false;
+                SearchSettings::debugInfo = false;
         } else {
-            m_debug = true;
+            SearchSettings::debugInfo = true;
         }
     } else if (line == QLatin1Literal("isready")) {
         sendReadyOk();
@@ -339,18 +337,28 @@ void UciEngine::readyRead(const QString &line)
     }
     // non-uci additions
     else if (line == QLatin1Literal("board")) {
-        output(History::globalInstance()->currentGame().stateOfGameToFen() + "\n");
+        const StandaloneGame game = History::globalInstance()->currentGame();
+        output(game.stateOfGameToFen() + "\n");
     } else if (line.startsWith("tree")) {
         int depth = 1;
+        QVector<QString> node;
+        const bool printPotentials = line.startsWith("treep");
+
         QList<QString> tree = line.split(' ');
-        if (tree.count() == 2) {
+        tree.pop_front();
+        for (QString arg : tree) {
             bool success;
-            int d  = tree.at(1).toInt(&success);
-            if (success)
+            int d  = arg.toInt(&success);
+            if (success) {
                 depth = d;
+                break;
+            } else {
+                node << arg;
+            }
         }
+
         if (m_searchEngine)
-            m_searchEngine->printTree(depth);
+            m_searchEngine->printTree(node, depth, printPotentials /*printPotentials*/);
     }
 }
 
@@ -420,55 +428,80 @@ void UciEngine::stopSearch()
         m_searchEngine->stopSearch();
 }
 
-void UciEngine::calculateRollingAverage(const SearchInfo &info)
+void UciEngine::calculateRollingAverage()
 {
-    const int n = History::globalInstance()->currentGame().halfMoveNumber() / 2;
-    if (!n)
-        return;
+    ++m_averageInfoN;
+    int n = m_averageInfoN;
 
-    m_averageInfo.depth             = rollingAverage(m_averageInfo.depth, info.depth, n);
-    m_averageInfo.seldepth          = rollingAverage(m_averageInfo.seldepth, info.seldepth, n);
-    m_averageInfo.nodes             = rollingAverage(m_averageInfo.nodes, info.nodes, n);
-    m_averageInfo.nps               = rollingAverage(m_averageInfo.nps, info.nps, n);
-    m_averageInfo.batchSize         = rollingAverage(m_averageInfo.batchSize, info.batchSize, n);
-    m_averageInfo.rawnps            = rollingAverage(m_averageInfo.rawnps, info.rawnps, n);
+    // Don't average the first sample
+    if (n < 2) {
+        m_averageInfo = m_lastInfo;
+        return;
+    }
+
+    m_averageInfo.depth             = rollingAverage(m_averageInfo.depth, m_lastInfo.depth, n);
+    m_averageInfo.seldepth          = rollingAverage(m_averageInfo.seldepth, m_lastInfo.seldepth, n);
+    m_averageInfo.nodes             = rollingAverage(m_averageInfo.nodes, m_lastInfo.nodes, n);
+    m_averageInfo.batchSize         = rollingAverage(m_averageInfo.batchSize, m_lastInfo.batchSize, n);
+
+    if (m_lastInfo.workerInfo.numberOfBatches >= m_minBatchesForAverage) {
+        Q_ASSERT(m_lastInfo.rawnps > 0);
+        m_averageInfo.nps               = rollingAverage(m_averageInfo.nps, m_lastInfo.nps, n);
+        m_averageInfo.rawnps            = rollingAverage(m_averageInfo.rawnps, m_lastInfo.rawnps, n);
+        m_averageInfo.nnnps             = rollingAverage(m_averageInfo.nnnps, m_lastInfo.nnnps, n);
+    }
 
     WorkerInfo &avgW = m_averageInfo.workerInfo;
-    const WorkerInfo &newW = info.workerInfo;
+    const WorkerInfo &newW = m_lastInfo.workerInfo;
     avgW.nodesSearched     = rollingAverage(avgW.nodesSearched, newW.nodesSearched, n);
     avgW.nodesEvaluated    = rollingAverage(avgW.nodesEvaluated, newW.nodesEvaluated, n);
-    avgW.nodesCreated      = rollingAverage(avgW.nodesCreated, newW.nodesCreated, n);
+    avgW.nodesVisited      = rollingAverage(avgW.nodesVisited, newW.nodesVisited, n);
     avgW.nodesTBHits       = rollingAverage(avgW.nodesTBHits, newW.nodesTBHits, n);
     avgW.nodesCacheHits    = rollingAverage(avgW.nodesCacheHits, newW.nodesCacheHits, n);
 }
 
-void UciEngine::sendBestMove(bool force)
+void UciEngine::sendBestMove()
 {
     // We don't have a best move yet!
     if (m_lastInfo.bestMove.isEmpty()) {
-        QString o = QString("No more time and no bestmove forced=%1!\n").arg(force ? "t" : "f");
-        output(o);
-        if (!force)
-            return;
+        m_pendingBestMove = true;
+        return;
     }
+
+    Q_ASSERT(!m_searchEngine->isStopped());
+    Q_ASSERT(m_clock->isActive());
 
     stopTheClock();
 
+    const qint64 extraBudgetedTime = qMax(qint64(0), m_clock->timeToDeadline());
+    const qint64 deadline = qMax(qint64(0), m_clock->deadline());
+    m_clock->setExtraBudgetedTime(!deadline ? 0 :
+        extraBudgetedTime / float(m_clock->deadline()) /
+            float(SearchSettings::openingTimeFactor));
+
 #if defined(DEBUG_TIME)
-    qint64 t = m_clock->timeToDeadline();
-    if (t < 0) {
+    {
         QString out;
         QTextStream stream(&out);
         stream << "info"
-            << " deadline " << m_clock->deadline()
-            << " timeBudgetExceeded " << qAbs(t)
-            << endl;
+               << " extraBudgetedTime " << extraBudgetedTime << " as percent " << m_clock->extraBudgetedTime()
+               << endl;
         output(out);
     }
 #endif
 
     if (Q_UNLIKELY(m_ioHandler))
         m_ioHandler->handleBestMove(m_lastInfo.bestMove);
+
+#if defined(DEBUG_TIME)
+    // This should only happen when we are completely out of time
+    if (!m_lastInfo.bestIsMostVisited) {
+        QString out;
+        QTextStream stream(&out);
+        stream << "info bestIsMostVisited " << (m_lastInfo.bestIsMostVisited ? "true" : "false") << endl;
+        output(out);
+    }
+#endif
 
     QString out;
     QTextStream stream(&out);
@@ -477,9 +510,14 @@ void UciEngine::sendBestMove(bool force)
     else
         stream << "bestmove " << m_lastInfo.bestMove << " ponder " << m_lastInfo.ponderMove << endl;
     output(out);
-    calculateRollingAverage(m_lastInfo);
 
     stopSearch(); // we block until the search has stopped
+
+    m_pendingBestMove = false;
+
+    calculateRollingAverage();
+    if (Q_UNLIKELY(m_ioHandler))
+        m_ioHandler->handleAverages(m_averageInfo);
 }
 
 void UciEngine::sendInfo(const SearchInfo &info, bool isPartial)
@@ -490,87 +528,100 @@ void UciEngine::sendInfo(const SearchInfo &info, bool isPartial)
 
     m_lastInfo = info;
 
-    // Check if we've already exceeded time
-    if (m_clock->hasExpired()) {
-        sendBestMove(true /*force*/);
-        return;
-    }
-
-    // Check if we've exceeded the ram limit for tree size
-    const quint64 treeSizeLimit = Options::globalInstance()->option("TreeSize").value().toUInt() * quint64(1024) * quint64(1024);
-    if (treeSizeLimit && quint64(info.workerInfo.nodesCreated) * sizeof(Node) > treeSizeLimit) {
-        sendBestMove(true /*force*/);
-        return;
-    }
-
     // Otherwise begin updating info
     qint64 msecs = m_clock->elapsed();
-    m_lastInfo.time = msecs;
+    m_lastInfo.calculateSpeeds(msecs);
+
+    // Check if we are in extended mode and best has become most visited
+    if (m_clock->isExtended() && m_lastInfo.bestIsMostVisited) {
+        sendBestMove();
+        return;
+    }
+
+    // Check if we've already exceeded time
+    if (m_clock->hasExpired()) {
+        sendBestMove();
+        return;
+    }
+
+    // Check if we are pending best move that has now been met
+    if (m_pendingBestMove && !m_lastInfo.bestMove.isEmpty()) {
+        sendBestMove();
+        return;
+    }
+
+    Q_ASSERT(!m_searchEngine->isStopped());
     m_clock->updateDeadline(m_lastInfo, isPartial);
 
-    const bool targetReached = (m_depthTargeted != -1 && m_lastInfo.depth >= m_depthTargeted)
-        || (m_nodesTargeted != -1 && m_lastInfo.nodes >= m_nodesTargeted)
-        || info.isDTZ;
+    const bool targetReached = m_lastInfo.isDTZ || (m_lastInfo.workerInfo.hasTarget && m_lastInfo.workerInfo.targetReached);
 
-    if (!targetReached && (isPartial && (msecs - m_timeAtLastProgress) < 2500))
-        return;
+    // Set the estimated number of nodes to be searched under deadline if we've been searching for
+    // at least N msecs and we want to early exit according to following paper:
+    // https://link.springer.com/chapter/10.1007/978-3-642-31866-5_4
+    const bool hasTarget = m_lastInfo.workerInfo.hasTarget;
 
-    m_timeAtLastProgress = msecs;
+    if (!hasTarget && !m_clock->isInfinite() && !m_clock->isMoveTime() && m_averageInfo.nodes > 0 && m_averageInfo.rawnps > 0) {
+        const qint64 timeToRemaining = m_clock->deadline() - msecs;
+        const quint32 e = qMax(quint32(1), quint32(timeToRemaining / 1000.0f * m_averageInfo.rawnps));
+        m_searchEngine->setEstimatedNodes(e);
+    }
 
-    m_lastInfo.nps = qRound(qreal(m_lastInfo.nodes) / qMax(qint64(1), msecs) * 1000.0);
-    m_lastInfo.rawnps = qRound(qreal(m_lastInfo.nodes) / qMax(qint64(1), msecs) * 1000.0);
     m_lastInfo.batchSize = 0;
     if (m_lastInfo.workerInfo.nodesEvaluated && m_lastInfo.workerInfo.numberOfBatches)
         m_lastInfo.batchSize = m_lastInfo.workerInfo.nodesEvaluated / m_lastInfo.workerInfo.numberOfBatches;
 
     if (Q_UNLIKELY(m_ioHandler))
-        m_ioHandler->handleInfo(m_lastInfo);
+        m_ioHandler->handleInfo(m_lastInfo, isPartial);
 
     QString out;
     QTextStream stream(&out);
 
 #if defined(DEBUG_TIME)
     stream << "info"
-        << " trend " << trendToString(m_lastInfo.trend)
-        << " trendDegree " << m_lastInfo.trendDegree
-        << " trendFactor " << m_clock->trendFactor()
         << " deadline " << m_clock->deadline()
         << " timeToDeadline " << m_clock->timeToDeadline()
         << endl;
 #endif
 
-    if (m_debug) {
+    if (SearchSettings::debugInfo) {
         stream << "info"
                << " isResume " << (m_lastInfo.isResume ? "true" : "false")
+               << " batchSize " << m_lastInfo.batchSize
                << " rawnps " << m_lastInfo.rawnps
-               << " efficiency " << m_lastInfo.workerInfo.nodesSearched / float(m_lastInfo.workerInfo.nodesEvaluated)
+               << " nnnps " << m_lastInfo.nnnps
+               << " efficiency " << m_lastInfo.workerInfo.nodesVisited / float(m_lastInfo.workerInfo.nodesEvaluated)
                << " nodesSearched " << m_lastInfo.workerInfo.nodesSearched
                << " nodesEvaluated " << m_lastInfo.workerInfo.nodesEvaluated
-               << " nodesCreated " << m_lastInfo.workerInfo.nodesCreated
+               << " nodesVisited " << m_lastInfo.workerInfo.nodesVisited
                << " nodesCacheHits " << m_lastInfo.workerInfo.nodesCacheHits
                << endl;
     }
 
-    const Game &g = History::globalInstance()->currentGame();
+    const Game g = History::globalInstance()->currentGame();
 
     stream << "info"
            << " depth " << m_lastInfo.depth
            << " seldepth " << m_lastInfo.seldepth
            << " nodes " << m_lastInfo.nodes
            << " nps " << m_lastInfo.nps
-           << " batchSize " << m_lastInfo.batchSize
            << " score " << m_lastInfo.score
            << " time " << m_lastInfo.time
-           << " hashfull " << qRound(Hash::globalInstance()->percentFull(g.halfMoveNumber()) * 1000.0f)
+           << " hashfull " << qRound(Cache::globalInstance()->percentFull(g.halfMoveNumber()) * 1000.0f)
            << " tbhits " << m_lastInfo.workerInfo.nodesTBHits
            << " pv " << m_lastInfo.pv
            << endl;
 
+    Q_ASSERT(m_lastInfo.depth > 0);
+    Q_ASSERT(m_lastInfo.seldepth > 0);
+    Q_ASSERT(m_lastInfo.nodes > 0);
+    Q_ASSERT(m_lastInfo.time >= 0);
+
+    Q_ASSERT(m_clock->isActive());
     output(out);
 
     // Stop at specific targets if requested or if we have a dtz move
     if (targetReached)
-        sendBestMove(true /*force*/);
+        sendBestMove();
 }
 
 void UciEngine::sendAverages()
@@ -578,16 +629,18 @@ void UciEngine::sendAverages()
     QString out;
     QTextStream stream(&out);
     stream << "info averages"
+           << " games " << m_averageInfo.games
            << " depth " << m_averageInfo.depth
            << " seldepth " << m_averageInfo.seldepth
            << " nodes " << m_averageInfo.nodes
            << " nps " << m_averageInfo.nps
-           << " batchSize " << m_averageInfo.batchSize
            << " rawnps " << m_averageInfo.rawnps
+           << " nnnps " << m_averageInfo.nnnps
+           << " batchSize " << m_averageInfo.batchSize
            << " efficiency " << m_averageInfo.workerInfo.nodesSearched / float(m_averageInfo.workerInfo.nodesEvaluated)
            << " nodesSearched " << m_averageInfo.workerInfo.nodesSearched
            << " nodesEvaluated " << m_averageInfo.workerInfo.nodesEvaluated
-           << " nodesCreated " << m_averageInfo.workerInfo.nodesCreated
+           << " nodesVisited " << m_averageInfo.workerInfo.nodesVisited
            << " nodesTBHits " << m_averageInfo.workerInfo.nodesTBHits
            << " nodesCacheHits " << m_averageInfo.workerInfo.nodesCacheHits
            << endl;
@@ -608,17 +661,26 @@ void UciEngine::uciNewGame()
 {
     //qDebug() << "uciNewGame";
     m_gameInitialized = true;
+    m_pendingBestMove = false;
 
-    Hash::globalInstance()->reset();
-    NeuralNet::globalInstance()->reset();
-    TB::globalInstance()->reset();
+    m_clock->setExtraBudgetedTime(0.f);
     m_searchEngine->reset();
+    Cache::globalInstance()->reset();
+    SearchSettings::debugInfo = Options::globalInstance()->option("DebugInfo").value() == "true";
+    SearchSettings::chess960 = Options::globalInstance()->option("UCI_Chess960").value() == "true";
+    SearchSettings::weightsFile = Options::globalInstance()->option("WeightsFile").value();
+    SearchSettings::openingTimeFactor = Options::globalInstance()->option("OpeningTimeFactor").value().toDouble();
+    SearchSettings::earlyExitFactor = Options::globalInstance()->option("EarlyExitFactor").value().toDouble();
+    Q_ASSERT(!SearchSettings::weightsFile.isEmpty());
+    NeuralNet::globalInstance()->setWeights(SearchSettings::weightsFile);
+    NeuralNet::globalInstance()->reset();
 
-    m_averageInfo = SearchInfo();
-#if defined(AVERAGES)
-    if (m_averageInfo.depth != -1)
-        sendAverages();
-#endif
+    // Don't average the nps unless we have at least two batches from each GPU
+    const int numberOfGPUCores = Options::globalInstance()->option("GPUCores").value().toInt();
+    m_minBatchesForAverage = numberOfGPUCores * 2;
+
+    TB::globalInstance()->reset();
+    ++m_averageInfo.games;
 }
 
 void UciEngine::ponderHit()
@@ -632,18 +694,40 @@ void UciEngine::ponderHit()
 void UciEngine::stop()
 {
     //qDebug() << "stop";
-    sendBestMove(true /*force*/);
+    if (m_clock->isActive() && !m_searchEngine->isStopped())
+        sendBestMove();
+}
+
+void UciEngine::stopRequested(bool earlyExit)
+{
+#if defined(DEBUG_TIME)
+    if (earlyExit) {
+        QString out;
+        QTextStream stream(&out);
+        stream << "info"
+               << " stopRequested estimatedNodes " << m_searchEngine->estimatedNodes()
+               << " rawnps " << m_averageInfo.rawnps
+               << endl;
+        output(out);
+    }
+#else
+    Q_UNUSED(earlyExit);
+#endif
+
+    //qDebug() << "stop";
+    stop();
 }
 
 void UciEngine::quit()
 {
     //qDebug() << "quit";
-#if defined(AVERAGES)
-    sendAverages();
-#endif
-    Q_ASSERT(m_searchEngine && m_gameInitialized);
-    if (m_searchEngine)
+    Q_ASSERT(m_searchEngine);
+    if (m_searchEngine && m_gameInitialized) {
+        if (SearchSettings::debugInfo)
+            sendAverages();
+        m_searchEngine->stopSearch();
         m_searchEngine->stopPonder();
+    }
     QCoreApplication::instance()->quit();
 }
 
@@ -656,7 +740,7 @@ void UciEngine::setPosition(const QString& position, const QVector<QString> &mov
         fen = position;
 
     if (!moves.isEmpty()) {
-        Game game(fen);
+        StandaloneGame game(fen);
         QVector<QString> movesMinusLast = moves;
         for (QString move : movesMinusLast) {
             Move mv = Notation::stringToMove(move, Chess::Computer);
@@ -665,7 +749,7 @@ void UciEngine::setPosition(const QString& position, const QVector<QString> &mov
             Q_ASSERT(success);
         }
     } else {
-        History::globalInstance()->addGame(Game(fen));
+        History::globalInstance()->addGame(StandaloneGame(fen));
     }
 }
 
@@ -691,14 +775,14 @@ void UciEngine::parseGo(const QString &line)
 
     Search search;
     if ((index = goLine.indexOf("searchmoves")) != -1) {
-        while (index++ < goLine.count()) {
+        while (++index < goLine.count()) {
             QString move = goLine.at(index);
             if (move.count() < 4 || !move.at(0).isLetter() || !move.at(1).isNumber())
                 break;
 
             Move mv = Notation::stringToMove(move, Chess::Computer);
             if (mv.isValid())
-                search.searchMoves << mv;
+                search.searchMoves << move;
         }
     }
 
@@ -718,7 +802,6 @@ void UciEngine::parseGo(const QString &line)
     search.mate = getNextIntAfterSearch(goLine, "mate");
     search.movetime = getNextIntAfterSearch(goLine, "movetime");
     search.infinite = goLine.contains("infinite");
-    search.game = History::globalInstance()->currentGame();
 
     go(search);
 }
@@ -745,25 +828,36 @@ void UciEngine::parseOption(const QString &line)
 
 void UciEngine::go(const Search& s)
 {
+    Q_ASSERT(m_searchEngine->isStopped());
+
     //qDebug() << "go";
     if (!m_gameInitialized)
         uciNewGame();
 
+    const StandaloneGame currentGame = History::globalInstance()->currentGame();
+    const Game::Position &p = currentGame.position();
     // Start the clock immediately
     m_clock->setTime(Chess::White, s.wtime);
     m_clock->setTime(Chess::Black, s.btime);
     m_clock->setIncrement(Chess::White, s.winc);
     m_clock->setIncrement(Chess::Black, s.binc);
     m_clock->setMoveTime(s.movetime);
-    m_clock->setInfinite(s.infinite || s.depth != -1);
-    m_clock->setMaterialScore(s.game.materialScore(Chess::White) + s.game.materialScore(Chess::Black));
-    m_clock->setHalfMoveNumber(s.game.halfMoveNumber());
-    m_clock->startDeadline(s.game.activeArmy());
-    m_timeAtLastProgress = 0;
-    m_depthTargeted = s.depth;
-    m_nodesTargeted = s.nodes;
+    m_clock->setInfinite(s.infinite || s.depth != -1 || s.nodes != -1);
+    m_clock->setMaterialScore(p.materialScore(Chess::White) + p.materialScore(Chess::Black));
+    m_clock->setHalfMoveNumber(currentGame.halfMoveNumber());
+    m_clock->resetExtension();
     m_lastInfo = SearchInfo();
 
+    // Actually start the clock
+    m_clock->startDeadline(p.activeArmy());
+#if defined(DEBUG_TIME)
+    QString out;
+    QTextStream stream(&out);
+    stream << "info"
+           << " clock deadline " << m_clock->deadline() << " extra time " << m_clock->extraBudgetedTime()
+           << endl;
+    output(out);
+#endif
     startSearch(s);
 }
 
@@ -780,6 +874,7 @@ void UciEngine::output(const QString &out)
     emit sendOutput(out);
 }
 
-void IOHandler::handleInfo(const SearchInfo &) {}
+void IOHandler::handleInfo(const SearchInfo &, bool) {}
 void IOHandler::handleBestMove(const QString &) {}
+void IOHandler::handleAverages(const SearchInfo &) {}
 

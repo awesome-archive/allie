@@ -70,6 +70,7 @@ private:
     QString m_max;
     QVector<QString> m_var;
     QString m_value;
+    QString m_valueType;
     friend class Options;
 };
 
@@ -100,8 +101,9 @@ private:
 class IOHandler {
 public:
     virtual ~IOHandler() {}
-    virtual void handleInfo(const SearchInfo &info);
+    virtual void handleInfo(const SearchInfo &info, bool isPartial);
     virtual void handleBestMove(const QString &bestMove);
+    virtual void handleAverages(const SearchInfo &info);
 };
 
 class UciEngine : public QObject {
@@ -118,16 +120,18 @@ public Q_SLOTS:
     void sendId();
     void sendUciOk();
     void sendReadyOk();
-    void sendBestMove(bool force = false);
+    void sendBestMove();
     void sendInfo(const SearchInfo &info, bool isPartial);
     void sendAverages();
     void sendOptions();
     void uciNewGame();
     void ponderHit();
     void stop();
+    void stopRequested(bool);
     void quit();
     void readyRead(const QString &line);
     void installIOHandler(IOHandler *io) { m_ioHandler = io; }
+    void resetRollingAverage() { m_averageInfo = SearchInfo(); m_averageInfoN = 0; }
 
 Q_SIGNALS:
     void sendOutput(const QString &output);
@@ -136,7 +140,7 @@ private:
     void stopTheClock();
     void startSearch(const Search &s);
     void stopSearch();
-    void calculateRollingAverage(const SearchInfo &info);
+    void calculateRollingAverage();
     void setPosition(const QString &position, const QVector<QString> &moves);
     void parseGo(const QString &move);
     void parseOption(const QString &option);
@@ -146,17 +150,16 @@ private:
     void output(const QString &out);
 
 private:
+    quint32 m_averageInfoN;
+    quint32 m_minBatchesForAverage;
     SearchInfo m_averageInfo;
     SearchInfo m_lastInfo;
-    bool m_debug;
     bool m_gameInitialized;
+    bool m_pendingBestMove;
     QString m_debugFile;
     QVector<UciOption> m_options;
     SearchEngine *m_searchEngine;
     QThread m_inputThread;
-    qint64 m_timeAtLastProgress;
-    qint64 m_depthTargeted;
-    qint64 m_nodesTargeted;
     Clock *m_clock;
     IOHandler *m_ioHandler;
 };

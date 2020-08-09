@@ -48,7 +48,8 @@ WeightsFile LoadWeightsFromFile(const std::string& filename);
 // files, returns one which has the latest modification date.
 std::string DiscoverWeightsFile();
 
-Network *createCudaFP16Network(const WeightsFile& file, int id);
-Network *createCudaNetwork(const WeightsFile& file, int id);
+Network *createCudaFP16Network(const WeightsFile& file, int id, bool useCustomWinograd);
+Network *createCudaNetwork(const WeightsFile& file, int id, bool useCustomWinograd);
+Network *createBlasNetwork(const WeightsFile& file);
 
 }  // namespace lczero

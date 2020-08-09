@@ -18,18 +18,4 @@
   Additional permission under GNU GPL version 3 section 7
 */
 
-#include "settings.h"
-
-#include <QGlobalStatic>
-
-class MySettings : public Settings { };
-Q_GLOBAL_STATIC(MySettings, settingsInstance)
-Settings *Settings::globalInstance()
-{
-    return settingsInstance();
-}
-
-Settings::Settings()
-    : m_isChess960(false)
-{
-}
+#include "tree.h"

@@ -22,6 +22,8 @@
 
 #include "uciengine.h"
 
+//#define RUN_PERFT
+
 class UCIIOHandler : public QObject, public IOHandler
 {
     Q_OBJECT
@@ -30,7 +32,7 @@ public:
         : QObject(parent) {}
     virtual ~UCIIOHandler() override {}
 
-    void handleInfo(const SearchInfo &info) override
+    void handleInfo(const SearchInfo &info, bool) override
     {
         m_lastInfo = info;
         emit receivedInfo();
@@ -38,6 +40,7 @@ public:
 
     void handleBestMove(const QString &bestMove) override
     {
+        Q_ASSERT(!bestMove.isEmpty());
         m_lastBestMove = bestMove;
         emit receivedBestMove();
     }
@@ -60,14 +63,50 @@ private:
     QString m_lastBestMove;
 };
 
-class TestGames: public QObject {
+class Tests: public QObject {
     Q_OBJECT
+
+    // helpers go here
+    static void testStart(const StandaloneGame &start);
+    struct PerftResult {
+        QString fen;
+        int depth = 0;
+        quint64 nodes = 0;
+        quint64 captures = 0;
+        quint64 ep = 0;
+        quint64 castles = 0;
+        quint64 promotions = 0;
+    };
+    static void perft(int depth, Node *parent, PerftResult *result);
+    static void generateEmbodiedChild(Node *parent, bool onlyUniquePositions, Node **generatedChild);
+
 private slots:
+    // Tests
+    void initTestCase();
+    void cleanupTestCase();
+    void init();
+    void cleanup();
+
+    // TestBasics
     void testBasicStructures();
     void testSizes();
+    void testCPFormula();
+    void testVLDFormula();
+#if defined(RUN_PERFT)
+    void testPerft();
+#endif
+
+    // TestCache
+    void testBasicCache();
     void testStartingPosition();
     void testStartingPositionBlack();
+
+    // TestGames
+    void testCastlingAnd960();
     void testSearchForMateInOne();
+    void testInstaMove();
+    void testEarlyExit();
+    void testHistory();
     void testThreeFold();
     void testThreeFold2();
     void testThreeFold3();
@@ -78,7 +117,15 @@ private slots:
     void testMateWithKBBvK();
     void testMateWithKQQvK();
     void testTB();
-    void testHashInsertAndRetrieve();
+    void testDoNotPropagateDrawnAsExact();
+    void testContext();
+
+    // Placed at the end because this turns off fathom and fathom is bugged
+    void testExhaustSearch();
+
+    // TestMath
+    void testFastLog();
+    void testFastPow();
 
 private:
     void checkGame(const QString &fen, const QVector<QString> &mv);

@@ -21,308 +21,629 @@
 #include "searchengine.h"
 
 #include <QtMath>
-#include <QThreadPool>
-#include <QtConcurrent/QtConcurrent>
-#include <QFuture>
 
+#include "cache.h"
 #include "game.h"
-#include "hash.h"
 #include "move.h"
 #include "node.h"
 #include "nn.h"
 #include "notation.h"
 #include "options.h"
-#include "treeiterator.h"
+#include "tree.h"
 
 //#define DEBUG_EVAL
+//#define DEBUG_VALIDATE_TREE
+//#define USE_DUMMY_NODES
 
-SearchWorker::SearchWorker(int id, QObject *parent)
+void actualFetchFromNN(Batch *batch)
+{
+    Computation *computation = NeuralNet::globalInstance()->acquireNetwork();
+    Q_ASSERT(computation);
+    computation->reset();
+    for (int index = 0; index < batch->count(); ++index) {
+        Node *node = batch->at(index);
+        computation->addPositionToEvaluate(node);
+    }
+
+#if defined(DEBUG_EVAL)
+    qDebug() << "fetching batch of size" << batch->count() << QThread::currentThread()->objectName();
+#endif
+    computation->evaluate();
+
+    Q_ASSERT(computation->positions() == batch->count());
+    if (computation->positions() != batch->count()) {
+        qCritical() << "NN index mismatch!";
+        return;
+    }
+
+    for (int index = 0; index < batch->count(); ++index) {
+        Node *node = batch->at(index);
+        Q_ASSERT(node->hasPotentials());
+        node->setPositionQValue(-computation->qVal(index));
+        if (node->hasPotentials()) {
+            Q_ASSERT(!node->isExact());
+            Q_ASSERT(node->position()->refs() == 1);
+            computation->setPVals(index, node);
+        }
+    }
+    NeuralNet::globalInstance()->releaseNetwork(computation);
+}
+
+void actualMinimaxTree(Tree *tree, WorkerInfo *info)
+{
+    // Gather minimax scores;
+    double newScores = 0;
+    quint32 newVisits = 0;
+    const quint64 originalEvaluated = info->nodesEvaluated;
+    Node::minimax(tree->embodiedRoot(), 0 /*depth*/, info, &newScores, &newVisits);
+#if defined(DEBUG_VALIDATE_TREE)
+    Node::validateTree(tree->embodiedRoot());
+#endif
+    info->numberOfBatches += info->nodesEvaluated > originalEvaluated ? 1 : 0;
+}
+
+void actualMinimaxBatch(Batch *batch, Tree *tree, WorkerInfo *info)
+{
+    for (int index = 0; index < batch->count(); ++index) {
+        Node *node = batch->at(index);
+        node->backPropagateDirty();
+    }
+
+    actualMinimaxTree(tree, info);
+}
+
+Batch *GuardedBatchQueue::acquireIn()
+{
+    QMutexLocker locker(&m_inMutex);
+    while (m_inQueue.isEmpty() && !m_stop)
+        m_inCondition.wait(locker.mutex());
+    if (m_stop)
+        return nullptr;
+    return m_inQueue.takeFirst();
+}
+
+void GuardedBatchQueue::releaseIn(Batch *batch)
+{
+    QMutexLocker locker(&m_inMutex);
+    m_inQueue.append(batch);
+    m_inCondition.wakeOne();
+}
+
+Batch *GuardedBatchQueue::acquireOut()
+{
+    QMutexLocker locker(&m_outMutex);
+    while (m_outQueue.isEmpty())
+        m_outCondition.wait(locker.mutex());
+    return m_outQueue.takeFirst();
+}
+
+void GuardedBatchQueue::releaseOut(Batch *batch)
+{
+    QMutexLocker locker(&m_outMutex);
+    m_outQueue.append(batch);
+    m_outCondition.wakeOne();
+}
+
+void GuardedBatchQueue::stop()
+{
+    QMutexLocker locker(&m_inMutex);
+    m_stop = true;
+    m_inCondition.wakeAll();
+}
+
+GPUWorker::GPUWorker(GuardedBatchQueue *queue, int maximumBatchSize,
+    QObject *parent)
+    : QThread(parent),
+    m_queue(queue)
+{
+    m_batchForEvaluating.reserve(maximumBatchSize);
+}
+
+GPUWorker::~GPUWorker()
+{
+}
+
+void GPUWorker::run()
+{
+    forever {
+        Batch *batch = m_queue->acquireIn(); // will block until a batch is ready
+        if (!batch)
+            return;
+
+        // Clear our internal queue
+        m_batchForEvaluating.clear();
+
+        // Generate potentials
+        for (int index = 0; index < batch->count(); ++index) {
+            Node *node = batch->at(index);
+            node->generatePotentials();
+            if (!node->isExact())
+                m_batchForEvaluating.append(node);
+        }
+
+        actualFetchFromNN(&m_batchForEvaluating);
+
+        for (int index = 0; index < m_batchForEvaluating.count(); ++index) {
+            Node *node = m_batchForEvaluating.at(index);
+            Node::sortByPVals(*node->position()->potentials());
+        }
+
+        m_queue->releaseOut(batch);
+    }
+}
+
+SearchWorker::SearchWorker(QObject *parent)
     : QObject(parent),
-      m_id(id),
-      m_reachedMaxBatchSize(false),
+      m_totalPlayouts(0),
+      m_moveNode(nullptr),
+      m_searchId(0),
+      m_currentBatchSize(0),
+      m_estimatedNodes(std::numeric_limits<quint32>::max()),
       m_tree(nullptr),
-      m_stop(false)
+      m_stop(true)
 {
 }
 
 SearchWorker::~SearchWorker()
 {
+    m_queue.stop(); // blocks and sets the queue to stop all workers
+    for (GPUWorker *w : m_gpuWorkers)
+        w->wait();
+    qDeleteAll(m_gpuWorkers);
+    m_gpuWorkers.clear();
+    qDeleteAll(m_batchPool);
+    m_batchPool.clear();
 }
 
 void SearchWorker::stopSearch()
 {
     m_stop = true;
-    QMutexLocker locker(&m_sleepMutex);
-    m_sleepCondition.wakeAll();
 }
 
-void SearchWorker::startSearch(Tree *tree)
+void SearchWorker::startSearch(Tree *tree, int searchId, const Search &s, const SearchInfo &info)
 {
     // Reset state
-    m_reachedMaxBatchSize = false;
     m_tree = tree;
+    m_searchId = searchId;
+    m_totalPlayouts = 0;
+    m_search = s;
+    m_currentInfo = info;
+    m_currentInfo.workerInfo.searchId = searchId;
+    Node *root = m_tree->embodiedRoot();
+    const Node *best = root->bestChild();
+    m_moveNode = best;
+    m_estimatedNodes = std::numeric_limits<quint32>::max();
     m_stop = false;
+
+    if (m_gpuWorkers.isEmpty()) {
+        // Start as many gpu worker threads as we have available networks and create a batch pool
+        // to satisfy those workers
+        const int maximumBatchSize = Options::globalInstance()->option("MaxBatchSize").value().toInt();
+        const int numberOfGPUCores = Options::globalInstance()->option("GPUCores").value().toInt() * 2;
+        m_queue.setMaximumBatchSize(maximumBatchSize);
+        for (int i = 0; i < numberOfGPUCores; ++i) {
+            GPUWorker *worker = new GPUWorker(&m_queue, maximumBatchSize);
+            worker->setObjectName(QString("gpuworker %0").arg(i));
+            worker->start();
+            m_gpuWorkers.append(worker);
+            Batch *batch = new Batch;
+            batch->reserve(maximumBatchSize);
+            m_batchPool.append(batch);
+        }
+    }
+
+    m_currentBatchSize = m_queue.maximumBatchSize();
+
+    // Start the info timer
+    m_timer.restart();
 
     // Start the search
     search();
 }
 
-void SearchWorker::fetchBatch(const QVector<Node*> &batch,
-    lczero::Network *network, Tree *tree, const WorkerInfo &info)
+void SearchWorker::minimaxBatch(Batch *batch, Tree *tree)
 {
-    Computation computation(network);
-    for (int index = 0; index < batch.count(); ++index) {
-        Node *node = batch.at(index);
-        computation.addPositionToEvaluate(node);
-    }
-
-#if defined(DEBUG_EVAL)
-    qDebug() << "fetching batch of size" << batch.count() << QThread::currentThread()->objectName();
-#endif
-    computation.evaluate();
-
-    NeuralNet::globalInstance()->releaseNetwork(network);
-
-    Q_ASSERT(computation.positions() == batch.count());
-    if (computation.positions() != batch.count()) {
-        qCritical() << "NN index mismatch!";
-        return;
-    }
-
-    {
-        QMutexLocker locker(&tree->mutex);
-        for (int index = 0; index < batch.count(); ++index) {
-            Node *node = batch.at(index);
-            Q_ASSERT((node->hasPotentials()) || node->isCheckMate() || node->isStaleMate());
-
-            {
-                node->setRawQValue(-computation.qVal(index));
-                if (node->hasPotentials()) {
-                    computation.setPVals(index, node);
-                }
-                if (!node->isPrefetch()) {
-                    node->setQValueAndPropagate();
-                }
-                Hash::globalInstance()->insert(node);
-            }
-        }
-    }
-
-    WorkerInfo myInfo = info;
-    myInfo.nodesEvaluated += batch.count();
-    myInfo.numberOfBatches += 1;
-    myInfo.threadId = QThread::currentThread()->objectName();
-    emit sendInfo(myInfo);
+    actualMinimaxBatch(batch, tree, &m_currentInfo.workerInfo);
+    processWorkerInfo();
 }
 
-void SearchWorker::fetchFromNN(const QVector<Node*> &nodesToFetch, const WorkerInfo &info)
+void SearchWorker::waitForFetched()
 {
-    Q_ASSERT(!nodesToFetch.isEmpty());
-    const int maximumBatchSize = Options::globalInstance()->option("MaxBatchSize").value().toInt();
+    Q_ASSERT(m_batchPool.count() != m_gpuWorkers.count());
+    Batch *batch = m_queue.acquireOut(); // blocks
+    Q_ASSERT(batch);
+    minimaxBatch(batch, m_tree);
+    m_batchPool.append(batch);
+    Q_ASSERT(!m_batchPool.isEmpty());
+}
 
-    if (!m_reachedMaxBatchSize && nodesToFetch.count() >= maximumBatchSize) {
-        m_reachedMaxBatchSize = true;
-        emit reachedMaxBatchSize();
-    }
+void SearchWorker::fetchFromNN(Batch *batch, bool sync)
+{
+    Q_ASSERT(!batch->isEmpty());
+    if (SearchSettings::featuresOff.testFlag(SearchSettings::Threading) || sync) {
+        // Generate potentials
+        Batch batchForEvaluating;
+        for (int index = 0; index < batch->count(); ++index) {
+            Node *node = batch->at(index);
+            node->generatePotentials();
+            if (!node->isExact())
+                batchForEvaluating.append(node);
+        }
+        actualFetchFromNN(&batchForEvaluating);
 
-    QVector<QVector<Node*>> batches;
-    int batchSize = maximumBatchSize;
-    if (nodesToFetch.count() > batchSize) {
-        div_t divresult;
-        divresult = div(nodesToFetch.count(), batchSize);
-        int buckets = divresult.quot + (divresult.rem ? 1 : 0);
-        for (int i = 0; i < buckets; ++i)
-            batches.append(nodesToFetch.mid(i * batchSize, batchSize));
-    } else
-        batches.append(nodesToFetch);
+        for (int index = 0; index < batchForEvaluating.count(); ++index) {
+            Node *node = batchForEvaluating.at(index);
+            Node::sortByPVals(*node->position()->potentials());
+        }
 
-    for (QVector<Node*> batch : batches) {
-        lczero::Network *network = NeuralNet::globalInstance()->acquireNetwork(); // blocks
-        Q_ASSERT(network);
-        std::function<void()> fetchBatch = std::bind(&SearchWorker::fetchBatch, this,
-            batch, network, m_tree, info);
-        m_futures.append(QtConcurrent::run(fetchBatch));
+        minimaxBatch(batch, m_tree);
+    } else {
+        m_queue.releaseIn(batch);
+        if (m_batchPool.isEmpty())
+            waitForFetched();
     }
 }
 
 bool SearchWorker::fillOutTree()
 {
-    const int numberOfGPUCores = Options::globalInstance()->option("GPUCores").value().toInt();
-    const int maximumBatchSize = Options::globalInstance()->option("MaxBatchSize").value().toInt();
-    const int maxSize = (numberOfGPUCores * maximumBatchSize);
-
-    // Scale the fetchSize by depth
-    const int fetchSize = maxSize;
-
-    bool didWork = false;
-    WorkerInfo info;
-    QVector<Node*> playouts = playoutNodesMCTS(fetchSize, &didWork, &info);
-    if (!playouts.isEmpty())
-        fetchFromNN(playouts, info);
-    else if (didWork)
-        emit sendInfo(info);
-    return didWork;
+    Q_ASSERT(!m_batchPool.isEmpty());
+    Batch *batch = m_batchPool.takeFirst();
+    batch->clear();
+    bool hardExit = false;
+    bool didWork = playoutNodes(batch, &hardExit);
+    if (batch->isEmpty() || SearchSettings::featuresOff.testFlag(SearchSettings::Threading))
+        m_batchPool.append(batch);
+    if (!batch->isEmpty() || didWork)
+        fetchAndMinimax(batch, false /*sync*/);
+    else if (!hardExit)
+        waitForFetched();
+    return hardExit;
 }
 
-bool SearchWorker::handlePlayout(Node *playout, int depth, WorkerInfo *info)
+void SearchWorker::fetchAndMinimax(Batch *batch, bool sync)
 {
-    info->nodesSearched += 1;
-    info->nodesSearchedTotal += playout->m_virtualLoss;
-    info->sumDepths += depth * int(playout->m_virtualLoss);
-    info->maxDepth = qMax(info->maxDepth, depth);
+    if (!batch->isEmpty()) {
+        fetchFromNN(batch, sync);
+    } else {
+        actualMinimaxTree(m_tree, &m_currentInfo.workerInfo);
+        processWorkerInfo();
+    }
+}
 
-#if defined(DEBUG_PLAYOUT_MCTS) || defined(DEBUG_PLAYOUT_AB)
-    qDebug() << "adding regular playout" << playout->toString() << "depth" << depth;
+bool SearchWorker::handlePlayout(Node *playout, Cache *cache)
+{
+#if defined(DEBUG_PLAYOUT)
+    qDebug() << "adding regular playout" << playout->toString();
 #endif
 
     // If we *re-encounter* an exact node that overrides the NN (checkmate/stalemate/drawish...)
     // then let's just *reset* (which is noop since it is exact) the value, increment and propagate
     // which is *not* noop
     if (playout->isExact()) {
-#if defined(DEBUG_PLAYOUT_MCTS)
+#if defined(DEBUG_PLAYOUT)
         qDebug() << "adding exact playout" << playout->toString();
 #endif
-        info->nodesCacheHits += 1;
-        QMutexLocker locker(&m_tree->mutex);
-        playout->setQValueAndPropagate();
+        playout->backPropagateDirty();
         return false;
     }
 
-    // If we encounter a playout that already has a rawQValue perhaps from a resumed search,
-    // or from a prefetch, then all we need to do is back propagate the value and continue
-    if (playout->hasRawQValue()) {
-#if defined(DEBUG_PLAYOUT_MCTS)
-        qDebug() << "found resumed playout" << playout->toString();
-#endif
-        info->nodesCacheHits += 1;
-        QMutexLocker locker(&m_tree->mutex);
-        playout->setPrefetch(false);
-        playout->setQValueAndPropagate();
+    // If we don't have a position, we must initialize it
+    quint64 hash = playout->initializePosition(cache);
+
+    // Check if we have found a draw by move clock or threefold
+    if (playout->checkMoveClockOrThreefold(hash, cache)) {
+        playout->backPropagateGameContextAndDirty();
         return false;
     }
 
-    // Generate potential moves of the node if possible
-    m_tree->mutex.lock();
-    const bool isTbHit = playout->generatePotentials();
-    if (isTbHit)
-        info->nodesTBHits += 1;
-    m_tree->mutex.unlock();
-
-    // If we *newly* discovered a playout that can override the NN (checkmate/stalemate/drawish...),
-    // then let's just set the value and propagate
-    if (playout->isExact()) {
-#if defined(DEBUG_PLAYOUT_MCTS)
-        qDebug() << "adding exact playout 2" << playout->toString();
-#endif
-        info->nodesCacheHits += 1;
-        QMutexLocker locker(&m_tree->mutex);
-        playout->setQValueAndPropagate();
-        return false;
-    }
-
-    // If this playout is in cache, retrieve the values and back propagate and continue
-    if (Hash::globalInstance()->contains(playout)) {
-#if defined(DEBUG_PLAYOUT_MCTS)
+    // We can go ahead and use the transposition iff it has already been scored, this is
+    // thread safe because the if the position does not have visits at this time, then it
+    // will have been made unique by the cache
+    if (playout->position()->hasQValue()) {
+        Q_ASSERT(!playout->position()->isUnique());
+        playout->setType(playout->positionType());
+        if (playout->type() == Node::Win)
+            playout->m_game.setCheckMate(true);
+        Q_ASSERT(playout->hasPotentials() || playout->isExact());
+#if defined(DEBUG_PLAYOUT)
         qDebug() << "found cached playout" << playout->toString();
 #endif
-        info->nodesCacheHits += 1;
-        QMutexLocker locker(&m_tree->mutex);
-        Hash::globalInstance()->fillOut(playout);
-        playout->setQValueAndPropagate();
+        if (!playout->isExact() && playout->repetitions()) {
+            playout->setContext(Node::GameCycleInTree);
+            playout->backPropagateGameCycleAndDirty();
+        } else
+            playout->backPropagateDirty();
         return false;
     }
 
     return true; // Otherwise we should fetch from NN
 }
 
-QVector<Node*> SearchWorker::playoutNodesMCTS(int size, bool *didWork, WorkerInfo *info)
+bool SearchWorker::playoutNodes(Batch *batch, bool *hardExit)
 {
-#if defined(DEBUG_PLAYOUT_MCTS)
-    qDebug() << "begin MCTS playout filling" << size;
+#if defined(DEBUG_PLAYOUT)
+    qDebug() << "begin playout filling" << m_currentBatchSize;
 #endif
 
+    bool didWork = false;
     int exactOrCached = 0;
-    QVector<Node*> nodes;
-    while (nodes.count() < size && exactOrCached < size) {
-        int depth = 0;
+    int vldMax = SearchSettings::vldMax;
+    int tryPlayoutLimit = SearchSettings::tryPlayoutLimit;
+    Cache *hash = Cache::globalInstance();
+    while (batch->count() < m_currentBatchSize) {
+        // Check if the we are out of nodes
+        if (hash->used() == hash->size() || m_totalPlayouts == m_search.nodes) {
+            *hardExit = true;
+            break;
+        }
 
-        m_tree->mutex.lock();
-        bool createdNode = false;
-        Node *playout = m_tree->root->playout(&depth, &createdNode);
-        if (createdNode)
-            info->nodesCreated += 1;
-        m_tree->mutex.unlock();
+        if (exactOrCached >= m_currentBatchSize) {
+            actualMinimaxTree(m_tree, &m_currentInfo.workerInfo);
+            processWorkerInfo();
+            exactOrCached = 0;
+            // I have not seen an infinite loop here, but I guess it is theoretically possible for
+            // some position in the wild, so add an extra check here just in case.
+            if (m_stop)
+                break;
+        }
 
+        Node *playout = Node::playout(m_tree->embodiedRoot(), &vldMax, &tryPlayoutLimit, hardExit, hash);
+        Q_ASSERT(!playout || playout->m_virtualLoss == 1);
         if (!playout)
             break;
 
-        *didWork = true;
+        didWork = true;
+        ++m_totalPlayouts;
 
-        bool shouldFetchFromNN = handlePlayout(playout, depth, info);
+        bool shouldFetchFromNN = handlePlayout(playout, hash);
         if (!shouldFetchFromNN) {
             ++exactOrCached;
             continue;
         }
 
-        Q_ASSERT(!nodes.contains(playout));
-        Q_ASSERT(!playout->hasQValue());
-        nodes.append(playout);
+        Q_ASSERT(!batch->contains(playout));
+        batch->append(playout);
     }
 
-#if defined(DEBUG_PLAYOUT_MCTS)
-    qDebug() << "end MCTS playout return" << nodes.count();
+#if defined(DEBUG_PLAYOUT)
+    qDebug() << "end playout return" << batch->count();
 #endif
 
-    return nodes;
+    // Dynamically adjust batchsize based on how well we are meeting the current batchsize target
+    if (batch->count() < m_currentBatchSize)
+        m_currentBatchSize = qMax(1, m_currentBatchSize - 1);
+    else if (batch->count() == m_currentBatchSize)
+        m_currentBatchSize = qMin(m_queue.maximumBatchSize(), m_currentBatchSize + 1);
+    return didWork;
+}
+
+void SearchWorker::ensureRootAndChildrenScored()
+{
+    Cache *hash = Cache::globalInstance();
+
+    {
+        // Fetch and minimax for root
+        Node *root = m_tree->embodiedRoot();
+        Batch nodes;
+        if (!root->m_visited) {
+            root->m_virtualLoss += 1;
+            bool shouldFetchFromNN = handlePlayout(root, hash);
+            if (shouldFetchFromNN)
+                nodes.append(root);
+            ++m_totalPlayouts;
+        }
+        fetchAndMinimax(&nodes, true /*sync*/);
+    }
+
+    {
+        // Fetch and minimax for children of root
+        bool didWork = false;
+        QVector<Node *> children;
+        Node *root = m_tree->embodiedRoot();
+
+        // Filter the root children if necessary
+        if (!m_search.searchMoves.isEmpty()) {
+            float total = 0;
+            QVector<Node::Potential> *potentials = root->position()->potentials();
+            QMutableVectorIterator<Node::Potential> it(*potentials);
+            while (it.hasNext()) {
+                Node::Potential p = it.next();
+                if (!m_search.searchMoves.contains(Notation::moveToString(p.move(), Chess::Computer)))
+                    it.remove();
+                else
+                    total += p.pValue();
+            }
+
+            // Rescale the pVals if necessary
+            const float scale = 1.0f / total;
+            for (int i = 0; i < potentials->size(); ++i) {
+                // We get a non-const reference to the actual value and change it in place
+                const Node::Potential *potential = &(*potentials)[i];
+                const_cast<Node::Potential*>(potential)->setPValue(scale * potential->pValue());
+            }
+
+            // Make it unique so the position can not be reused since we are fundamentally altering
+            hash->nodePositionMakeUnique(root->position()->positionHash());
+        }
+
+        for (int i = root->m_potentialIndex; i < root->m_position->potentials()->count(); ++i) {
+            Node::NodeGenerationError error = Node::NoError;
+            Node *child = root->generateNextChild(Cache::globalInstance(), &error);
+            Q_ASSERT(child);
+            child->m_virtualLoss += 1;
+            children.append(child);
+            didWork = true;
+        }
+
+        Batch nodes;
+        for (Node *child : children) {
+            bool shouldFetchFromNN = handlePlayout(child, hash);
+            if (shouldFetchFromNN)
+                nodes.append(child);
+            ++m_totalPlayouts;
+        }
+
+        if (didWork)
+            fetchAndMinimax(&nodes, true /*sync*/);
+    }
 }
 
 void SearchWorker::search()
 {
+    ensureRootAndChildrenScored();
+
     // Main iteration loop
     while (!m_stop) {
-
-        // Clear out any finished futures
-        QMutableVectorIterator<QFuture<void>> it(m_futures);
-        while (it.hasNext()) {
-            QFuture<void> f = it.next();
-            if (f.isFinished())
-                it.remove();
-        }
-
         // Fill out the tree
-        const bool didWork = fillOutTree();
-        if (!didWork) {
-#if defined(DEBUG_EVAL)
-            qDebug() << QThread::currentThread()->objectName() << "sleeping";
-#endif
-            QMutexLocker locker(&m_sleepMutex);
-            m_sleepCondition.wait(locker.mutex(), 10);
-        }
+        bool hardExit = fillOutTree();
+        if (hardExit)
+            emit requestStop(m_searchId, false /*isEarlyExit*/);
     }
 
     // Notify stop
-    for (QFuture<void> f : m_futures)
-        f.waitForFinished();
-    m_futures.clear();
+    while (m_batchPool.count() != m_gpuWorkers.count())
+        waitForFetched();
 
-    emit searchStopped();
+#if defined(DEBUG_VALIDATE_TREE)
+    Tree::validateTree(m_tree->embodiedRoot(), nullptr);
+#endif
+
+    emit searchWorkerStopped();
 }
 
-void SearchWorker::printTree(int depth) const
-{
-    if (m_tree->root)
-        qDebug().noquote() << m_tree->root->printTree(depth);
+QString mateDistanceOrScore(float score, int pvDepth, bool isCheckMate) {
+    QString s = QString("cp %0").arg(scoreToCP(score));
+    if (isCheckMate && score > 0)
+        s = QString("mate %0").arg(qCeil(qreal(pvDepth - 1) / 2));
+    else if (isCheckMate && score < 0)
+        s = QString("mate -%0").arg(qCeil(qreal(pvDepth - 1) / 2));
+    return s;
 }
 
-WorkerThread::WorkerThread(int id)
+void SearchWorker::processWorkerInfo()
 {
-    worker = new SearchWorker(id);
+    // Update our depth info
+    const quint32 newDepth = qMax(quint32(1), quint32(m_currentInfo.workerInfo.sumDepths /
+        qMax(quint64(1), m_currentInfo.workerInfo.nodesVisited)));
+    bool isPartial = newDepth <= m_currentInfo.depth;
+    m_currentInfo.depth = qMax(newDepth, m_currentInfo.depth);
+
+    // Update our seldepth info
+    const quint32 newSelDepth = qMax(quint32(1), m_currentInfo.workerInfo.maxDepth);
+    isPartial = newSelDepth > m_currentInfo.seldepth ? false : isPartial;
+    m_currentInfo.seldepth = qMax(newSelDepth, m_currentInfo.seldepth);
+
+    // Update our node info
+    m_currentInfo.nodes = qMax(quint64(1), m_currentInfo.workerInfo.nodesSearched);
+
+    // See if root has a best child
+    Node *root = m_tree->embodiedRoot();
+    const Node *best = root->bestChild();
+    if (!best)
+        return;
+
+    // If so, record our new bestmove
+    Q_ASSERT(best);
+    Q_ASSERT(best->parent());
+    const bool hasNewMove = best != m_moveNode;
+    isPartial = hasNewMove ? false : isPartial;
+
+    m_currentInfo.workerInfo.hasTarget = m_search.depth != -1 || m_search.nodes != -1;
+    m_currentInfo.workerInfo.targetReached = (m_search.depth != -1 && m_currentInfo.depth >= m_search.depth)
+        || (m_search.nodes != -1 && qint64(m_currentInfo.workerInfo.nodesVisited) >= m_search.nodes);
+
+#if !defined(NDEBUG)
+    bool rootPlayedOut = false;
+#endif
+
+    // If we've set a target, make sure that root is not completely played out, otherwise set
+    // target reached flag to true
+    if (m_currentInfo.workerInfo.hasTarget && !root->hasPotentials()) {
+        QVector<Node*> children = *root->children();
+        bool allAreExact = true;
+        for (Node *node : children)
+            allAreExact = node->isExact() ? allAreExact : false;
+        if (allAreExact) {
+            m_currentInfo.workerInfo.targetReached = true;
+#if !defined(NDEBUG)
+            rootPlayedOut = true;
+#endif
+        }
+    }
+
+#if !defined(NDEBUG)
+    // Check that fixed nodes always is exactly equal to the actual number of nodes visited
+    if (m_currentInfo.workerInfo.targetReached && m_search.nodes != -1)
+        Q_ASSERT(rootPlayedOut || qint64(m_currentInfo.workerInfo.nodesVisited) == m_search.nodes);
+#endif
+
+    isPartial = m_currentInfo.workerInfo.targetReached ? false : isPartial;
+
+    // Check for an early exit
+    bool shouldEarlyExit = false;
+    Q_ASSERT(root->hasChildren());
+    const bool onlyOneLegalMove = (!root->hasPotentials() && root->children()->count() == 1);
+    if (onlyOneLegalMove && m_search.searchMoves.count() != 1) {
+        shouldEarlyExit = true;
+        m_currentInfo.bestIsMostVisited = true;
+    } else {
+        QVector<Node*> children = *root->children();
+        if (children.count() > 1) {
+            // Sort top two by score
+            std::partial_sort(children.begin(), children.begin() + 2, children.end(),
+                [](const Node *a, const Node *b) {
+                return Node::greaterThan(a, b);
+            });
+            const Node *firstChild = children.at(0);
+            const Node *secondChild = children.at(1);
+            const qint64 diff = qint64(firstChild->m_visited) - qint64(secondChild->m_visited);
+            const bool bestIsMostVisited = diff >= 0 || qFuzzyCompare(firstChild->qValue(), secondChild->qValue());
+            shouldEarlyExit = bestIsMostVisited && diff >= m_estimatedNodes * SearchSettings::earlyExitFactor;
+            m_currentInfo.bestIsMostVisited = bestIsMostVisited;
+        } else {
+            m_currentInfo.bestIsMostVisited = true;
+            isPartial = true;
+        }
+    }
+
+    const quint64 msecs = m_timer.nsecsElapsed() / 1000000;
+    if (!isPartial || msecs >= 2500) {
+        if (hasNewMove) {
+            // Record a new best move
+            m_moveNode = best;
+            m_currentInfo.bestMove = Notation::moveToString(best->m_game.lastMove(), Chess::Computer);
+
+            // Record a ponder move
+            if (const Node *ponder = best->bestChild())
+                m_currentInfo.ponderMove = Notation::moveToString(ponder->m_game.lastMove(), Chess::Computer);
+            else
+                m_currentInfo.ponderMove = QString();
+        }
+
+        // Record a pv and score
+        float score = best->qValue();
+        int pvDepth = 0;
+        bool isCheckMate = false;
+        m_currentInfo.pv = QString();
+        QTextStream stream(&m_currentInfo.pv);
+        root->principalVariation(&pvDepth, &isCheckMate, &stream);
+        m_currentInfo.score = mateDistanceOrScore(score, pvDepth, isCheckMate);
+        m_timer.restart();
+        emit sendInfo(m_currentInfo, isPartial);
+    }
+
+    if (!SearchSettings::featuresOff.testFlag(SearchSettings::EarlyExit) && shouldEarlyExit)
+        emit requestStop(m_searchId, true /*isEarlyExit*/);
+}
+
+WorkerThread::WorkerThread()
+{
+    worker = new SearchWorker;
     worker->moveToThread(&thread);
     QObject::connect(&thread, &QThread::finished,
                      worker, &SearchWorker::deleteLater);
     QObject::connect(this, &WorkerThread::startWorker,
                      worker, &SearchWorker::startSearch);
-    QThreadPool::globalInstance()->reserveThread();
 }
 
 WorkerThread::~WorkerThread()
@@ -335,11 +656,10 @@ WorkerThread::~WorkerThread()
 SearchEngine::SearchEngine(QObject *parent)
     : QObject(parent),
     m_tree(new Tree),
-    m_startedWorkers(0),
-    m_score(0),
-    m_trendDegree(0.0f),
-    m_trend(Better),
-    m_stop(false)
+    m_searchId(0),
+    m_startedWorker(false),
+    m_worker(nullptr),
+    m_stop(true)
 {
     qRegisterMetaType<Search>("Search");
     qRegisterMetaType<SearchInfo>("SearchInfo");
@@ -348,144 +668,132 @@ SearchEngine::SearchEngine(QObject *parent)
 
 SearchEngine::~SearchEngine()
 {
-    gcNode(m_tree->root);
     delete m_tree;
     m_tree = nullptr;
-    qDeleteAll(m_workers);
-    m_workers.clear();
-    m_startedWorkers = 0;
+    delete m_worker;
+    m_worker = nullptr;
+    m_searchId = 0;
+    m_startedWorker = false;
+}
+
+quint32 SearchEngine::estimatedNodes() const
+{
+    return m_worker->worker->estimatedNodes();
+}
+
+void SearchEngine::setEstimatedNodes(quint32 nodes)
+{
+    if (!m_startedWorker)
+        return;
+
+    Q_ASSERT(!m_stop);
+    Q_ASSERT(m_worker && m_worker->worker);
+    m_worker->worker->setEstimatedNodes(nodes);
 }
 
 void SearchEngine::reset()
 {
     QMutexLocker locker(&m_mutex);
-    const int numberOfGPUCores = Options::globalInstance()->option("GPUCores").value().toInt();
-    const int numberOfThreads = Options::globalInstance()->option("Threads").value().toInt();
-    const int numberOfSearchThreads = qMax(1, numberOfGPUCores * numberOfThreads);
-    if (m_workers.count() != numberOfThreads) {
-        qDeleteAll(m_workers);
-        m_workers.clear();
-        for (int i = 0; i < numberOfSearchThreads; ++i) {
-            WorkerThread *w = new WorkerThread(i);
-            if (!i)
-                w->thread.setObjectName("search main");
-            else
-                w->thread.setObjectName("search" + QString::number(i));
-            w->thread.start();
-            w->thread.setPriority(QThread::TimeCriticalPriority);
-            // The search stopped *has* to be direct connection as the main thread will block
-            // waiting for it to ensure that we only have one search going on at a time
-            connect(w->worker, &SearchWorker::searchStopped,
-                    this, &SearchEngine::searchStopped, Qt::DirectConnection);
-            connect(w->worker, &SearchWorker::sendInfo,
-                    this, &SearchEngine::receivedWorkerInfo);
-            connect(w->worker, &SearchWorker::reachedMaxBatchSize,
-                    this, &SearchEngine::workerReachedMaxBatchSize);
-            m_workers.append(w);
-        }
-    }
+    Q_ASSERT(m_stop); // we should be stopped before a reset
+
+    // Reset the tree which assumes the cache has already been reset
+    m_tree->reset();
+
+    // Reset the search worker
+    delete m_worker;
+    m_worker = new WorkerThread;
+    m_worker->thread.setObjectName("search main");
+    m_worker->thread.start();
+    m_worker->thread.setPriority(QThread::TimeCriticalPriority);
+    // The search stopped *has* to be direct connection as the main thread will block
+    // waiting for it to ensure that we only have one search going on at a time
+    connect(m_worker->worker, &SearchWorker::searchWorkerStopped,
+            this, &SearchEngine::searchWorkerStopped, Qt::DirectConnection);
+    connect(m_worker->worker, &SearchWorker::sendInfo,
+            this, &SearchEngine::receivedSearchInfo);
+    connect(m_worker->worker, &SearchWorker::requestStop,
+            this, &SearchEngine::receivedRequestStop);
 }
 
-void SearchEngine::gcNode(Node *node)
-{
-    if (!node) // safe to delete nullptr
-        return;
-
-    // Deletes the node and all of its children in post order traversal
-    QVector<Node*> gc;
-    TreeIterator<PreOrder> it = node->begin<PreOrder>();
-    for (; it != node->end<PreOrder>(); ++it)
-        gc.append(*it);
-    qDeleteAll(gc);
-}
-
-void SearchEngine::resetSearch(const Search &s)
-{
-    std::function<void()> gc = std::bind(&SearchEngine::gcNode, m_tree->root);
-    QtConcurrent::run(gc);
-    m_tree->root = new Node(nullptr, s.game);
-}
-
-bool SearchEngine::tryResumeSearch(const Search &s)
-{
-    if (!m_tree->root)
-        return false;
-
-    const QVector<Node*> ch = m_tree->root->children();
-    for (Node *child : ch) {
-        const QVector<Node*> gch = child->children();
-        for (Node *grandChild : gch) {
-            if (grandChild->m_game.isSamePosition(s.game) && !grandChild->isExact()) {
-                grandChild->setAsRootNode();
-                std::function<void()> gc = std::bind(&SearchEngine::gcNode, m_tree->root);
-                QtConcurrent::run(gc);
-                m_tree->root = grandChild;
-                return true;
-            }
-        }
-    }
-    return false;
-}
-
-QString mateDistanceOrScore(float score, int pvDepth) {
-    QString s = QString("cp %0").arg(scoreToCP(score));
-    if (score > 1.0f || qFuzzyCompare(score, 1.0f))
-        s = QString("mate %0").arg(qCeil(qreal(pvDepth - 1) / 2));
-    else if (score < -1.0f || qFuzzyCompare(score, -1.0f))
-        s = QString("mate -%0").arg(qCeil(qreal(pvDepth - 1) / 2));
-    return s;
-}
-
-void SearchEngine::startSearch(const Search &s)
+void SearchEngine::startSearch(const Search &search)
 {
     QMutexLocker locker(&m_mutex);
+    Q_ASSERT(m_stop);
 
-    // Try to resume where we left off
-    bool resumeSearch = tryResumeSearch(s);
-    if (!resumeSearch)
-        resetSearch(s);
+    // Set the search parameters
+    SearchSettings::cpuctF = Options::globalInstance()->option("CpuctF").value().toFloat();
+    SearchSettings::cpuctInit = Options::globalInstance()->option("CpuctInit").value().toFloat();
+    SearchSettings::cpuctBase = Options::globalInstance()->option("CpuctBase").value().toFloat();
+    SearchSettings::featuresOff = SearchSettings::stringToFeatures(Options::globalInstance()->option("FeaturesOff").value());
+    SearchSettings::fpuReduction = Options::globalInstance()->option("ReduceFPU").value().toFloat();
+    SearchSettings::policySoftmaxTemp = Options::globalInstance()->option("PolicySoftmaxTemp").value().toFloat();
+    SearchSettings::policySoftmaxTempInverse = 1 / SearchSettings::policySoftmaxTemp;
+    SearchSettings::tryPlayoutLimit = Options::globalInstance()->option("TryPlayoutLimit").value().toInt();
 
-    m_startedWorkers = 0;
-    m_score = 0;
-    m_trendDegree = 0.0f;
-    m_trend = Better;
-    m_currentInfo = SearchInfo();
+    // Remove the old root if it exists
+    m_tree->clearRoot(!SearchSettings::featuresOff.testFlag(SearchSettings::TreeReuse));
+
+    m_startedWorker = false;
     m_stop = false;
 
-    if (m_tree->root) {
-        // Check the DTZ and if found just use it and stop the search
-        int dtz = 0;
-        if (m_tree->root->checkAndGenerateDTZ(&dtz)) {
-            // We found a dtz move
-            const int depth = dtz;
-            m_currentInfo.isDTZ = true;
-            m_currentInfo.depth = depth;
-            m_currentInfo.seldepth = depth;
-            m_currentInfo.nodes = depth;
-            m_currentInfo.workerInfo.nodesSearched += 1;
-            m_currentInfo.workerInfo.nodesSearchedTotal += 1;
-            m_currentInfo.workerInfo.sumDepths = depth;
-            m_currentInfo.workerInfo.maxDepth = depth;
-            Node *dtzNode = m_tree->root->leftChild();
-            Q_ASSERT(dtzNode);
-            m_currentInfo.bestMove = Notation::moveToString(dtzNode->m_game.lastMove(), Chess::Computer);
-            m_currentInfo.pv = m_currentInfo.bestMove;
-            m_currentInfo.score = mateDistanceOrScore(-dtzNode->qValue(), depth + 1);
-            emit sendInfo(m_currentInfo, false /*isPartial*/);
-            return; // We are all done
-        } else if (Node *best = m_tree->root->bestChild(Node::MCTS)) {
-            // If we have a bestmove candidate, set it now
-            m_currentInfo.isResume = true;
-            m_currentInfo.bestMove = Notation::moveToString(best->m_game.lastMove(), Chess::Computer);
-            if (Node *ponder = best->bestChild(Node::MCTS))
-                m_currentInfo.ponderMove = Notation::moveToString(ponder->m_game.lastMove(), Chess::Computer);
-            emit sendInfo(m_currentInfo, true /*isPartial*/);
-        }
+    bool onlyLegalMove = false;
+
+    Node *root = m_tree->embodiedRoot();
+    Q_ASSERT(root);
+
+    // Check the DTZ and if found just use it and stop the search
+    int dtz = 0;
+    SearchInfo info;
+    if (root->checkAndGenerateDTZ(&dtz)) {
+        // We found a dtz move
+        const int depth = dtz;
+        info.isDTZ = true;
+        info.depth = depth;
+        info.seldepth = depth;
+        info.nodes = depth;
+        info.workerInfo.nodesSearched += 1;
+        info.workerInfo.nodesVisited += 1;
+        info.workerInfo.nodesTBHits += 1;
+        info.workerInfo.sumDepths = depth;
+        info.workerInfo.maxDepth = depth;
+        const Node *dtzNode = root->bestChild();
+        Q_ASSERT(dtzNode);
+        info.bestMove = Notation::moveToString(dtzNode->m_game.lastMove(), Chess::Computer);
+        info.pv = info.bestMove;
+        info.score = mateDistanceOrScore(-dtzNode->qValue(), depth + 1, dtzNode->isCheckMate());
+        emit sendInfo(info, false /*isPartial*/);
+        return; // We are all done
+    } else if (const Node *best = root->bestChild()) {
+        // If we have a bestmove candidate, set it now
+        info.depth = 1;
+        info.seldepth = 1;
+        info.nodes = 1;
+        info.isResume = true;
+        info.bestMove = Notation::moveToString(best->m_game.lastMove(), Chess::Computer);
+        if (const Node *ponder = best->bestChild())
+            info.ponderMove = Notation::moveToString(ponder->m_game.lastMove(), Chess::Computer);
+        else
+            info.ponderMove = QString();
+        onlyLegalMove = !root->hasPotentials() && root->children()->count() == 1;
+        int pvDepth = 0;
+        bool isCheckMate = false;
+        info.pv = QString();
+        QTextStream stream(&info.pv);
+        root->principalVariation(&pvDepth, &isCheckMate, &stream);
+        float score = best->qValue();
+        info.score = mateDistanceOrScore(score, pvDepth, isCheckMate);
+        emit sendInfo(info, !onlyLegalMove /*isPartial*/);
     }
 
-    Q_ASSERT(!m_workers.isEmpty());
-    m_workers.first()->startWorker(m_tree);
-    ++m_startedWorkers;
+    if (onlyLegalMove) {
+        requestStop(true /*isEarlyExit*/);
+    } else if (!m_stop) {
+        // We check if we've already been requested to stop as the sendInfo above and a very low
+        // clock might have already stopped the search before the worker can even get started
+        Q_ASSERT(m_worker);
+        m_worker->startWorker(m_tree, m_searchId, search, info);
+        m_startedWorker = true;
+    }
 }
 
 void SearchEngine::stopSearch()
@@ -493,125 +801,61 @@ void SearchEngine::stopSearch()
     // First, change our state to stop using thread safe atomic
     m_stop = true;
 
-    if (!m_startedWorkers)
+    // Now, increment the searchId to guard against stale info
+    ++m_searchId;
+
+    if (!m_startedWorker)
         return;
 
     // Now lock a mutex and stop the workers until all of them signal stopped
     QMutexLocker locker(&m_mutex);
-    for (WorkerThread *w : m_workers)
-        w->worker->stopSearch(); // thread safe using atomic
-    while (m_startedWorkers)
+    m_worker->worker->stopSearch(); // thread safe using atomic
+    while (m_startedWorker)
         m_condition.wait(locker.mutex());
 }
 
-void SearchEngine::searchStopped()
+void SearchEngine::searchWorkerStopped()
 {
     QMutexLocker locker(&m_mutex);
-    --m_startedWorkers;
+    m_startedWorker = false;
     m_condition.wakeAll();
 }
 
-void SearchEngine::printTree(int depth)
-{
-    if (m_tree->root)
-        qDebug().noquote() << m_tree->root->printTree(depth);
-}
-
-void SearchEngine::receivedWorkerInfo(const WorkerInfo &info)
+void SearchEngine::receivedSearchInfo(const SearchInfo &info, bool isPartial)
 {
     // It is possible this could have been queued before we were asked to stop
     // so ignore if so
-    if (m_stop)
+    if (m_stop || info.workerInfo.searchId != m_searchId)
         return;
 
-    // Sum the worker infos
-    m_currentInfo.workerInfo.sumDepths += info.sumDepths;
-    m_currentInfo.workerInfo.maxDepth = qMax(m_currentInfo.workerInfo.maxDepth, info.maxDepth);
-    m_currentInfo.workerInfo.nodesSearched += info.nodesSearched;
-    m_currentInfo.workerInfo.nodesSearchedTotal += info.nodesSearchedTotal;
-    m_currentInfo.workerInfo.nodesEvaluated += info.nodesEvaluated;
-    m_currentInfo.workerInfo.nodesCreated += info.nodesCreated;
-    m_currentInfo.workerInfo.numberOfBatches += info.numberOfBatches;
-    m_currentInfo.workerInfo.nodesTBHits += info.nodesTBHits;
-    m_currentInfo.workerInfo.nodesCacheHits += info.nodesCacheHits;
+    emit sendInfo(info, isPartial);
+}
 
-    // Update our depth info
-    const int newDepth = m_currentInfo.workerInfo.sumDepths / qMax(1, m_currentInfo.workerInfo.nodesSearched);
-    bool isPartial = newDepth <= m_currentInfo.depth;
-    m_currentInfo.depth = qMax(newDepth, m_currentInfo.depth);
+void SearchEngine::receivedRequestStop(quint32 searchId, bool isEarlyExit)
+{
+    // It is possible this could have been queued before we were asked to stop
+    // so ignore if so
+    if (m_stop || searchId != m_searchId)
+        return;
 
-    // Update our seldepth info
-    const int newSelDepth = m_currentInfo.workerInfo.maxDepth;
-    isPartial = newSelDepth > m_currentInfo.seldepth ? false : isPartial;
-    m_currentInfo.seldepth = qMax(newSelDepth, m_currentInfo.seldepth);
-
-    // Update our node info
-    m_currentInfo.nodes = m_currentInfo.workerInfo.nodesSearchedTotal;
-
-    // Lock the tree for reading
-    m_tree->mutex.lock();
-
-    // See if root has a best child
-    Node *best = m_tree->root->bestChild(Node::MCTS);
-    if (!best) {
-        m_tree->mutex.unlock();
+    emit requestStop(isEarlyExit);
+}
+void SearchEngine::printTree(const QVector<QString> &node, int depth, bool printPotentials) const
+{
+    if (!m_stop) {
+        qWarning() << "We can only print the tree when the search is stopped!";
         return;
     }
 
-    // If so, record our new bestmove
-    Q_ASSERT(best);
-    const QString newBestMove = Notation::moveToString(best->m_game.lastMove(), Chess::Computer);
-    isPartial = newBestMove != m_currentInfo.bestMove ? false : isPartial;
-    m_currentInfo.bestMove = newBestMove;
-
-    // Record a ponder move
-    if (Node *ponder = best->bestChild(Node::MCTS))
-        m_currentInfo.ponderMove = Notation::moveToString(ponder->m_game.lastMove(), Chess::Computer);
-
-    // Record a pv and score
-    int pvDepth = 0;
-    m_currentInfo.pv = m_tree->root->principalVariation(&pvDepth, Node::MCTS);
-
-    float score = best->hasQValue() ? best->qValue() : -best->parent()->qValue();
-
-    // Unlock for read
-    m_tree->mutex.unlock();
-
-    m_currentInfo.score = mateDistanceOrScore(score, pvDepth);
-
-    // Update our trend
-    Trend t;
-    if (qFuzzyCompare(score, m_score))
-        t = m_trend;
-    else if (score < m_score)
-        t = Worse;
-    else
-        t = Better;
-
-    static const float scaleScore = qAbs(cpToScore(900)); // a queen
-    m_trend = t;
-    m_trendDegree = qAbs(score - m_score) / scaleScore;
-    m_score = score;
-    m_currentInfo.trend = m_trend;
-    m_currentInfo.trendDegree = m_trendDegree;
-
-    emit sendInfo(m_currentInfo, isPartial);
-}
-
-void SearchEngine::workerReachedMaxBatchSize()
-{
-    QMutexLocker locker(&m_mutex);
-    // It is possible this could have been queued before we were asked to stop
-    // so ignore if so
-    if (m_stop)
-        return;
-
-    // Try and start another worker if we have any
-    if (m_startedWorkers < m_workers.count()) {
-#if defined(DEBUG_EVAL)
-        qDebug() << "Starting worker" << m_startedWorkers;
-#endif
-        m_workers.at(m_startedWorkers)->startWorker(m_tree);
-        ++m_startedWorkers;
+    const Node *n = m_tree->embodiedRoot();
+    if (n) {
+        if (!node.isEmpty())
+            n = n->findSuccessor(node);
+        if (n) {
+            qDebug() << "printing" << node.toList().join(" ") << "at depth" << depth << "with potentials" << printPotentials;
+            qDebug().noquote() << n->printTree(n->depth(), depth, printPotentials);
+        } else {
+            qDebug() << "could not find" << node.toList().join(" ") << "in tree";
+        }
     }
 }

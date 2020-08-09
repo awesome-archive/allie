@@ -53,7 +53,7 @@ using InputPlanes = std::vector<InputPlane>;
 class NetworkComputation {
  public:
   // Adds a sample to the batch.
-  virtual void AddInput(InputPlanes&& input) = 0;
+  virtual void AddInput(InputPlanes *input) = 0;
   // Do the computation.
   virtual void ComputeBlocking() = 0;
   // Returns how many times AddInput() was called.
@@ -68,6 +68,7 @@ class NetworkComputation {
 
 class Network {
  public:
+  virtual bool isCPU() const = 0;
   virtual std::unique_ptr<NetworkComputation> NewComputation() = 0;
   virtual ~Network(){};
 };

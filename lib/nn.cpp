@@ -27,112 +27,109 @@
 #include "bitboard.h"
 #include "chess.h"
 #include "game.h"
+#include "history.h"
 #include "neural/loader.h"
 #include "neural/nn_policy.h"
 #include "node.h"
 #include "notation.h"
 #include "options.h"
+#include "fastapprox/fastpow.h"
 
 using namespace Chess;
 using namespace lczero;
+
+//#define USE_UNIFORM_BACKEND
+//#define USE_FAST_UNIFORM_POLICY
 
 const int s_moveHistory = 8;
 const int s_planesPerPos = 13;
 const int s_planeBase = s_planesPerPos * s_moveHistory;
 
-InputPlanes gameToInputPlanes(const Node *node)
+inline void encodeGame(int i, const Game &g, const Game::Position &p,
+    InputPlanes *result, Chess::Army us, Chess::Army them, bool nextMoveIsBlack)
 {
-    Game game = node->game();
-    QVector<Game> games = node->previousMoves(false /*fullHistory*/);
-    games << game; // add the current position
+    BitBoard ours = us == White ? p.board(White) : p.board(Black);
+    BitBoard theirs = them == White ? p.board(White) : p.board(Black);
+    BitBoard pawns = p.board(Pawn);
+    BitBoard knights = p.board(Knight);
+    BitBoard bishops = p.board(Bishop);
+    BitBoard rooks = p.board(Rook);
+    BitBoard queens = p.board(Queen);
+    BitBoard kings = p.board(King);
 
-    int index = qMax(0, games.count() - s_moveHistory);
-    games = games.mid(index);
-    Q_ASSERT(!games.isEmpty());
-    Q_ASSERT(games.count() <= s_moveHistory);
+    // If we are evaluating from black's perspective we need to flip the boards...
+    if (nextMoveIsBlack) {
+        ours.mirror();
+        theirs.mirror();
+        pawns.mirror();
+        knights.mirror();
+        bishops.mirror();
+        rooks.mirror();
+        queens.mirror();
+        kings.mirror();
+    }
+
+    const size_t base = size_t(i * s_planesPerPos);
+
+    (*result)[base + 0].mask = (ours & pawns).data();
+    (*result)[base + 1].mask = (ours & knights).data();
+    (*result)[base + 2].mask = (ours & bishops).data();
+    (*result)[base + 3].mask = (ours & rooks).data();
+    (*result)[base + 4].mask = (ours & queens).data();
+    (*result)[base + 5].mask = (ours & kings).data();
+
+    (*result)[base + 6].mask = (theirs & pawns).data();
+    (*result)[base + 7].mask = (theirs & knights).data();
+    (*result)[base + 8].mask = (theirs & bishops).data();
+    (*result)[base + 9].mask = (theirs & rooks).data();
+    (*result)[base + 10].mask = (theirs & queens).data();
+    (*result)[base + 11].mask = (theirs & kings).data();
+    if (g.repetitions() >= 1)
+        (*result)[base + 12].SetAll();
+
+    // FIXME: Encode enpassant target
+}
+
+inline void gameToInputPlanes(const Node *node, std::vector<InputPlane> *result)
+{
+    const Game &game = node->game();
+    const Game::Position &position = node->position()->position();
+
+    // *us* refers to the perspective of whoever is next to move
+    const bool nextMoveIsBlack = position.activeArmy() == Black;
+    const Chess::Army us = nextMoveIsBlack ? Black : White;
+    const Chess::Army them = nextMoveIsBlack ? White : Black;
+
+    HistoryIterator it = HistoryIterator::begin(node);
+    int gamesEncoded = 0;
+    Game lastGameEncoded = game;
+    Game::Position lastPositionEncoded = position;
+    for (; it != HistoryIterator::end() && gamesEncoded < s_moveHistory; ++it, ++gamesEncoded) {
+        Game g = it.game();
+        Game::Position p = it.position();
+        encodeGame(gamesEncoded, g, p, result, us, them, nextMoveIsBlack);
+        lastGameEncoded = g;
+        lastPositionEncoded = p;
+    }
 
     // Add fake history by repeating the position to fill it up as long as the last position in the
     // real history is not the startpos
-    if (games.first() != Game()) {
-        while (games.count() < s_moveHistory)
-            games.prepend(games.first());
-    }
-
-    InputPlanes result(s_planeBase + s_moveHistory);
-
-    // *us* refers to the perspective of whoever is next to move
-    bool nextMoveIsBlack = game.activeArmy() == Black;
-    Chess::Army us = nextMoveIsBlack ? Black : White;
-    Chess::Army them = nextMoveIsBlack ? White : Black;
-
-    QVector<Game>::const_reverse_iterator it = games.crbegin();
-    for (int i = 0; it != games.crend(); ++it, ++i) {
-
-        Game g = *it;
-        BitBoard ours = us == White ? g.board(White) : g.board(Black);
-        BitBoard theirs = them == White ? g.board(White) : g.board(Black);
-        BitBoard pawns = g.board(Pawn);
-        BitBoard knights = g.board(Knight);
-        BitBoard bishops = g.board(Bishop);
-        BitBoard rooks = g.board(Rook);
-        BitBoard queens = g.board(Queen);
-        BitBoard kings = g.board(King);
-
-        // If we are evaluating from black's perspective we need to flip the boards...
-        if (nextMoveIsBlack) {
-            ours.mirror();
-            theirs.mirror();
-            pawns.mirror();
-            knights.mirror();
-            bishops.mirror();
-            rooks.mirror();
-            queens.mirror();
-            kings.mirror();
+    if (lastGameEncoded != Game()) {
+        while (gamesEncoded < s_moveHistory) {
+            encodeGame(gamesEncoded, lastGameEncoded, lastPositionEncoded, result, us, them, nextMoveIsBlack);
+            ++gamesEncoded;
         }
-
-        const size_t base = size_t(i * s_planesPerPos);
-
-        result[base + 0].mask = (ours & pawns).data();
-        result[base + 1].mask = (ours & knights).data();
-        result[base + 2].mask = (ours & bishops).data();
-        result[base + 3].mask = (ours & rooks).data();
-        result[base + 4].mask = (ours & queens).data();
-        result[base + 5].mask = (ours & kings).data();
-
-        result[base + 6].mask = (theirs & pawns).data();
-        result[base + 7].mask = (theirs & knights).data();
-        result[base + 8].mask = (theirs & bishops).data();
-        result[base + 9].mask = (theirs & rooks).data();
-        result[base + 10].mask = (theirs & queens).data();
-        result[base + 11].mask = (theirs & kings).data();
-        if (g.repetitions() >= 1)
-            result[base + 12].SetAll();
-
-        // FIXME: Encode enpassant target
     }
 
-#if 0
-    {
-        QVector<Move> moves;
-        QVector<Game>::const_iterator it = games.begin();
-        for (; it != games.end(); ++it) {
-            moves << (*it).lastMove();
-        }
-        qDebug() << "generating eval for" << moves;
-    }
-#endif
-
-    if (game.isCastleAvailable(us, QueenSide)) result[s_planeBase + 0].SetAll();
-    if (game.isCastleAvailable(us, KingSide)) result[s_planeBase + 1].SetAll();
-    if (game.isCastleAvailable(them, QueenSide)) result[s_planeBase + 2].SetAll();
-    if (game.isCastleAvailable(them, KingSide)) result[s_planeBase + 3].SetAll();
-    if (us == Chess::Black) result[s_planeBase + 4].SetAll();
-    result[s_planeBase + 5].Fill(game.halfMoveClock());
+    if (position.isCastleAvailable(us, QueenSide)) (*result)[s_planeBase + 0].SetAll();
+    if (position.isCastleAvailable(us, KingSide)) (*result)[s_planeBase + 1].SetAll();
+    if (position.isCastleAvailable(them, QueenSide)) (*result)[s_planeBase + 2].SetAll();
+    if (position.isCastleAvailable(them, KingSide)) (*result)[s_planeBase + 3].SetAll();
+    if (us == Chess::Black) (*result)[s_planeBase + 4].SetAll();
+    (*result)[s_planeBase + 5].Fill(game.halfMoveClock());
     // Plane s_planeBase + 6 used to be movecount plane, now it's all zeros.
     // Plane s_planeBase + 7 is all ones to help NN find board edges.
-    result[s_planeBase + 7].SetAll();
-
-    return result;
+    (*result)[s_planeBase + 7].SetAll();
 }
 
 static WeightsFile s_weights;
@@ -146,7 +143,8 @@ NeuralNet *NeuralNet::globalInstance()
 
 NeuralNet::NeuralNet()
     : m_weightsValid(false),
-    m_usingFP16(false)
+    m_usingFP16(false),
+    m_usingCustomWinograd(false)
 {
 }
 
@@ -155,36 +153,38 @@ NeuralNet::~NeuralNet()
     qDeleteAll(m_availableNetworks);
 }
 
-Network *NeuralNet::createNewNetwork(int id, bool useFP16) const
+Network *NeuralNet::createNewGPUNetwork(int id, bool useFP16, bool useCustomWinograd) const
 {
     Q_ASSERT(m_weightsValid);
     if (!m_weightsValid)
         qFatal("Could not load NN weights!");
 
     if (useFP16)
-        return createCudaFP16Network(s_weights, id);
+        return createCudaFP16Network(s_weights, id, useCustomWinograd);
     else
-        return createCudaNetwork(s_weights, id);
+        return createCudaNetwork(s_weights, id, useCustomWinograd);
 }
 
 void NeuralNet::reset()
 {
-    if (!m_weightsValid) {
-        s_weights = LoadWeightsFromFile(DiscoverWeightsFile());
-        m_weightsValid = true;
-    }
-
+    Q_ASSERT(m_weightsValid);
     const int numberOfGPUCores = Options::globalInstance()->option("GPUCores").value().toInt();
     const bool useFP16 = Options::globalInstance()->option("UseFP16").value() == "true";
+    const bool useCustomWinograd = Options::globalInstance()->option("UseCustomWinograd").value() == "true";
     if (numberOfGPUCores == m_availableNetworks.count()
-        && useFP16 == m_usingFP16)
+        && useFP16 == m_usingFP16
+        && useCustomWinograd == m_usingCustomWinograd)
         return; // Nothing to do
 
     m_usingFP16 = useFP16;
+    m_usingCustomWinograd = useCustomWinograd;
     qDeleteAll(m_availableNetworks);
     m_availableNetworks.clear();
-    for (int i = 0; i < numberOfGPUCores; ++i)
-        m_availableNetworks.append(createNewNetwork(i, m_usingFP16));
+    for (int i = 0; i < numberOfGPUCores; ++i) {
+        QSharedPointer<lczero::Network> network(createNewGPUNetwork(i, m_usingFP16, m_usingCustomWinograd));
+        m_availableNetworks.append(new Computation(network));
+        m_availableNetworks.append(new Computation(network));
+    }
 }
 
 void NeuralNet::setWeights(const QString &pathToWeights)
@@ -198,7 +198,7 @@ void NeuralNet::setWeights(const QString &pathToWeights)
     }
 }
 
-Network *NeuralNet::acquireNetwork()
+Computation *NeuralNet::acquireNetwork()
 {
     QMutexLocker locker(&m_mutex);
     while (m_availableNetworks.isEmpty())
@@ -206,19 +206,19 @@ Network *NeuralNet::acquireNetwork()
     return m_availableNetworks.takeFirst();
 }
 
-void NeuralNet::releaseNetwork(Network *network)
+void NeuralNet::releaseNetwork(Computation *network)
 {
     QMutexLocker locker(&m_mutex);
     m_availableNetworks.append(network);
     m_condition.wakeAll();
 }
 
-Computation::Computation(Network *network)
+Computation::Computation(QSharedPointer<lczero::Network> network)
     : m_positions(0),
     m_network(network),
     m_computation(nullptr)
 {
-    m_acquired = m_network != nullptr;
+    m_inputPlanes.resize(s_planeBase + s_moveHistory);
 }
 
 Computation::~Computation()
@@ -226,19 +226,19 @@ Computation::~Computation()
     clear();
 }
 
+void Computation::reset()
+{
+    clear();
+    m_computation = m_network->NewComputation().release();
+}
+
 int Computation::addPositionToEvaluate(const Node *node)
 {
-    if (!m_computation) {
-        Q_ASSERT(m_acquired == (m_network != nullptr));
-        if (!m_network) {
-            m_network = NeuralNet::globalInstance()->acquireNetwork(); // blocks
-        }
-        m_computation = m_network->NewComputation().release();
-    }
-
-    const int maximumBatchSize = Options::globalInstance()->option("MaxBatchSize").value().toInt();
-    Q_ASSERT(m_positions <= maximumBatchSize);
-    m_computation->AddInput(gameToInputPlanes(node));
+    m_inputPlanes.clear();
+    m_inputPlanes.resize(s_planeBase + s_moveHistory);
+    gameToInputPlanes(node, &m_inputPlanes);
+    Q_ASSERT(m_computation);
+    m_computation->AddInput(&m_inputPlanes);
     return m_positions++;
 }
 
@@ -249,7 +249,9 @@ void Computation::evaluate()
         return;
     }
 
+#if !defined(USE_UNIFORM_BACKEND)
     m_computation->ComputeBlocking();
+#endif
 }
 
 void Computation::clear()
@@ -257,33 +259,55 @@ void Computation::clear()
     m_positions = 0;
     delete m_computation;
     m_computation = nullptr;
-    if (!m_acquired)
-        NeuralNet::globalInstance()->releaseNetwork(m_network); // release back into the pool
-    m_network = nullptr;
 }
 
 float Computation::qVal(int index) const
 {
+    Q_ASSERT(m_computation);
     Q_ASSERT(index < m_positions);
+#if !defined(USE_UNIFORM_BACKEND)
     return m_computation->GetQVal(index);
+#else
+    return 0.0f;
+#endif
 }
 
 void Computation::setPVals(int index, Node *node) const
 {
+#if defined(USE_FAST_UNIFORM_POLICY)
+    QVector<Node::Potential> *potentials = node->position()->potentials();
+    for (int i = 0; i < potentials->count(); ++i)
+        (&(*potentials)[i])->setPValue(1.0f);
+#else
+    Q_ASSERT(m_computation);
     Q_ASSERT(index < m_positions);
-    const float kPolicySoftmaxTemp = 2.2f; // default of lc0
+    Q_ASSERT(node);
     Q_ASSERT(node->hasPotentials());
-    QVector<PotentialNode*> potentials = node->potentials();
-    QMultiHash<float, PotentialNode*> policyValues;
+    const Chess::Army activeArmy = node->position()->position().activeArmy();
+    const QVector<Node::Potential> *potentials = node->position()->potentials();
     float total = 0;
-    for (PotentialNode *n : potentials) {
-        Move mv = n->move();
-        if (node->game().activeArmy() == Chess::Black)
+    for (int i = 0; i < potentials->size(); ++i) {
+        // We get a non-const reference to the actual value and change it in place
+        const Node::Potential *potential = &(*potentials)[i];
+        Move mv = potential->move();
+        if (activeArmy == Chess::Black)
             mv.mirror(); // nn index expects the board to be flipped
-        float p = powf(m_computation->GetPVal(index, moveToNNIndex(mv)), 1 / kPolicySoftmaxTemp);
+#if !defined(USE_UNIFORM_BACKEND)
+        const float p = fastpow(m_computation->GetPVal(index, moveToNNIndex(mv)), SearchSettings::policySoftmaxTempInverse);
+#else
+        float fakePolicy = 1.0f;
+        moveToNNIndex(mv);
+        const float p = fastpow(fakePolicy, SearchSettings::policySoftmaxTempInverse);
+#endif
         total += p;
-        policyValues.insert(p, n);
+        const_cast<Node::Potential*>(potential)->setPValue(p);
     }
 
-    return normalizeNNPolicies(policyValues, total);
+    const float scale = 1.0f / total;
+    for (int i = 0; i < potentials->size(); ++i) {
+        // We get a non-const reference to the actual value and change it in place
+        const Node::Potential *potential = &(*potentials)[i];
+        const_cast<Node::Potential*>(potential)->setPValue(scale * potential->pValue());
+    }
+#endif
 }

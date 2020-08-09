@@ -24,46 +24,6 @@
 
 #include "notation.h"
 
-BitBoard::BitBoard(const Square &square)
-    : m_data(0)
-{
-    setSquare(square);
-}
-
-SquareList BitBoard::occupiedSquares() const
-{
-    SquareList occupiedList;
-    for (int i = 0; i < 64; i++) {
-        if (testBit(i))
-            occupiedList << indexToSquare(i);
-    }
-    return occupiedList;
-}
-
-void BitBoard::setBoard(const SquareList &squareList)
-{
-    if (squareList.isEmpty())
-        return;
-
-    m_data = 0;
-
-    for (Square square : squareList) {
-        if (square.isValid())
-            setSquare(square);
-    }
-}
-
-void BitBoard::setSquare(const Square &square)
-{
-    int index = squareToIndex(square);
-    setBit(index);
-}
-
-int BitBoard::count() const
-{
-    return int(qPopulationCount(m_data));
-}
-
 QDebug operator<<(QDebug debug, const BitBoard &b)
 {
     debug.nospace();

@@ -28,11 +28,11 @@
 class Zobrist {
 public:
     static Zobrist *globalInstance();
-    quint64 hash(const Game &game) const;
+    quint64 hash(const Game::Position &position) const;
 
 private:
     Zobrist();
-    QVector<QVector<quint64>> m_pieceKeys;
+    quint64 m_pieceKeys[64][12];
     QVector<quint64> m_otherKeys;
     friend class MyZobrist;
 };

@@ -50,26 +50,45 @@ public:
         quint64 m_data;
     };
 
-    BitBoard() { m_data = 0; }
-    BitBoard(quint64 data) { m_data = data; }
-    BitBoard(const Square &square);
+    inline BitBoard() { m_data = 0; }
+    inline BitBoard(quint64 data) { m_data = data; }
+    inline BitBoard(const Square &square)
+        : m_data(0)
+    {
+        setSquare(square);
+    }
 
     inline bool isClear() const
     {
         return m_data == 0;
     }
 
-    Iterator begin() const { return Iterator(m_data); }
-    Iterator end() const { return Iterator(0); }
+    inline Iterator begin() const { return Iterator(m_data); }
+    inline Iterator end() const { return Iterator(0); }
 
     inline bool isSquareOccupied(const Square &square) const
     {
         return testBit(squareToIndex(square));
     }
 
-    SquareList occupiedSquares() const;
-    void setBoard(const SquareList &squareList);
-    void setSquare(const Square &square);
+    inline void setBoard(const SquareList &squareList)
+    {
+        if (squareList.isEmpty())
+            return;
+
+        m_data = 0;
+
+        for (Square square : squareList) {
+            if (square.isValid())
+                setSquare(square);
+        }
+    }
+
+    inline void setSquare(const Square &square)
+    {
+        int index = squareToIndex(square);
+        setBit(index);
+    }
 
     inline static Square indexToSquare(quint8 bit)
     {
@@ -92,9 +111,17 @@ public:
                  (m_data & 0xFF00FF00FF00FF00) >> 8;
     }
 
-    quint64 data() const { return m_data; }
+    inline quint64 data() const { return m_data; }
 
-    int count() const;
+    inline int count() const
+    {
+        return int(qPopulationCount(m_data));
+    }
+
+    inline Square first() const
+    {
+        return quint8(qCountTrailingZeroBits(m_data));
+    }
 
     inline bool testBit(int i) const
     {

@@ -272,7 +272,7 @@ namespace lc0 {
     };
 }
 
-lc0::Promotion moveToPromotion(const Move &move)
+inline lc0::Promotion moveToPromotion(const Move &move)
 {
     switch (move.promotion()) {
     case Chess::Unknown:
@@ -292,21 +292,21 @@ lc0::Promotion moveToPromotion(const Move &move)
     return lc0::None;
 }
 
-int squareToNNIndex(const Square &sq)
+inline int squareToNNIndex(const Square &sq)
 {
     return sq.data();
 }
 
-quint16 moveToInt(const Move &move)
+inline quint16 moveToInt(const Move &move)
 {
     int startIndex = squareToNNIndex(move.start());
     int endIndex = squareToNNIndex(move.end());
-    if (move.promotion() == Chess::Knight) {
+    const quint16 promotion = static_cast<quint16>(moveToPromotion(move));
+    if (promotion == lc0::Knight) {
         return quint16(startIndex * 64 + endIndex);
     } else {
         // The encoding for moves in the NN only includes promotions for white so we need to flip
         // the square indexes to align with the NN
-        quint16 promotion = static_cast<quint16>(moveToPromotion(move));
         if (promotion > 0 && !move.end().rank()) {
             Square start = move.start();
             start.mirror();
@@ -319,21 +319,21 @@ quint16 moveToInt(const Move &move)
     }
 }
 
-QVector<quint16> BuildMoveIndices()
+std::vector<quint16> BuildMoveIndices()
 {
-    QVector<quint16> res(4 * 64 * 64);
+    std::vector<quint16> res(4 * 64 * 64);
     for (quint16 i = 0; i < sizeof(kIdxToSAN) / sizeof(kIdxToSAN[0]); ++i) {
         Move mv = Notation::stringToMove(kIdxToSAN[i], Chess::Computer);
         quint16 index = moveToInt(mv);
 //        qDebug().noquote() << Notation::moveToString(mv, Chess::Computer) << "is " << index << " is " << i;
-        Q_ASSERT(index < res.count());
+        Q_ASSERT(index < res.size());
         res[index] = i;
     }
 
     return res;
 }
 
-const QVector<quint16> kMoveToIdx = BuildMoveIndices();
+const std::vector<quint16> kMoveToIdx = BuildMoveIndices();
 const quint16 kKingCastleIndex =
         kMoveToIdx[squareToNNIndex(Notation::stringToSquare("e1")) * 64 + squareToNNIndex(Notation::stringToSquare("h1"))];
 const quint16 kQueenCastleIndex =
@@ -341,22 +341,9 @@ const quint16 kQueenCastleIndex =
 
 quint16 moveToNNIndex(const Move &move)
 {
-    if (!move.isCastle()) return kMoveToIdx[moveToInt(move)];
-    if (move.start().file() < move.end().file()) return kKingCastleIndex;
+    if (!move.isCastle())
+        return kMoveToIdx[moveToInt(move)];
+    if (move.start().file() < move.end().file())
+        return kKingCastleIndex;
     return kQueenCastleIndex;
-}
-
-void normalizeNNPolicies(const QMultiHash<float, PotentialNode*> &policies, float total)
-{
-    QMultiHash<float, PotentialNode*>::const_iterator it = policies.begin();
-    const float scale = 1.0f / total;
-    float normalizedTotal = 0;
-    for (; it != policies.end(); ++it) {
-        float normalizedP = scale * it.key();
-        it.value()->setPValue(normalizedP);
-        normalizedTotal += normalizedP;
-    }
-//    if (!qFuzzyCompare(normalizedTotal, 1.0f))
-//        qDebug() << normalizedTotal;
-//    Q_ASSERT(qFuzzyCompare(normalizedTotal, 1.0f));
 }

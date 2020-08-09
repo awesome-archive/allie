@@ -21,11 +21,11 @@
 #include <QtCore>
 #include <QtTest/QtTest>
 
-#include "hash.h"
+#include "cache.h"
 #include "movegen.h"
 #include "nn.h"
 #include "options.h"
-#include "testgames.h"
+#include "tests.h"
 #include "version.h"
 #include "zobrist.h"
 
@@ -33,16 +33,16 @@
 
 int main(int argc, char* argv[])
 {
+    qputenv("QTEST_FUNCTION_TIMEOUT", QString::number(std::numeric_limits<int>::max()).toLatin1().constData());
     QCoreApplication a(argc, argv);
     a.setApplicationName(APP_NAME);
     a.setApplicationVersion(versionString());
 
-    Options::globalInstance()->setOption("SyzygyPath",
-        QCoreApplication::applicationDirPath() + QDir::separator() + "../../syzygy/");
+    Options::globalInstance()->addRegularOptions();
 
     int rc = 0;
-    TestGames test1;
-    rc = QTest::qExec(&test1, argc, argv) == 0 ? rc : -1;
+    Tests tests;
+    rc = QTest::qExec(&tests, argc, argv) == 0 ? rc : -1;
 
     return rc;
 }

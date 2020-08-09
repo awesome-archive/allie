@@ -18,14 +18,11 @@
   Additional permission under GNU GPL version 3 section 7
 */
 
-#ifndef TREEUTILS_H
-#define TREEUTILS_H
+#include "cache.h"
 
-enum Traversal {
-    PreOrder,
-    InOrder,
-    PostOrder,
-    DepthOnly,
-};
-
-#endif // TREEUTILS_H
+class MyCache : public Cache { };
+Q_GLOBAL_STATIC(MyCache, CacheInstance)
+Cache* Cache::globalInstance()
+{
+    return CacheInstance();
+}

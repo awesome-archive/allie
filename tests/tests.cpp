@@ -18,31 +18,32 @@
   Additional permission under GNU GPL version 3 section 7
 */
 
-#ifndef HASH_H
-#define HASH_H
+#include <QtCore>
 
-#include <QtGlobal>
-#include <QCache>
+#include "cache.h"
+#include "game.h"
+#include "history.h"
+#include "node.h"
+#include "options.h"
+#include "tests.h"
 
-struct HashEntry;
-class Node;
-class Hash {
-public:
-    static Hash *globalInstance();
+void Tests::initTestCase()
+{
+    Options::globalInstance()->setOption("SyzygyPath",
+        QCoreApplication::applicationDirPath() + QDir::separator() + "../../syzygy/");
+    Options::globalInstance()->setOption("Cache", QLatin1Literal("100000"));
+}
 
-    void reset();
-    bool contains(const Node *node) const;
-    bool fillOut(Node *node) const;
-    void insert(const Node *node);
-    quint64 size() const;
-    float percentFull(int halfMoveNumber) const;
+void Tests::cleanupTestCase()
+{
+}
 
-private:
-    Hash();
-    ~Hash();
-    void clear();
-    QCache<quint64, HashEntry> *m_cache;
-    friend class MyHash;
-};
+void Tests::init()
+{
+    Cache::globalInstance()->reset();
+    History::globalInstance()->clear();
+}
 
-#endif // HASH_H
+void Tests::cleanup()
+{
+}

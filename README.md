@@ -14,7 +14,7 @@ Not exactly. AF and the Stein are (apparently quite successful) experiments with
 
 ## Ok, so details. How is she different?
 
-Well, I was inspired during the original CCC to see if you could pair traditional AlphaBeta search with an NN. This is still her main purpose and the focus going forward. However, the initial versions are using a similar MCTS algorithm as Lc0 and AlphaZero.
+Well, I was inspired during the original CCC to see if you could pair traditional Minimax/AlphaBeta search with an NN. This is still her main purpose and the focus going forward. However, the initial versions were using a similar pure MCTS algorithm as Lc0 and AlphaZero. The current versions of Allie use a modified hybrid search of Minimax and Monte Carlo.
 
 Here is a non-exhaustive list of differences:
 - UCI protocol code
@@ -43,11 +43,11 @@ Here is what Allie uses from the Lc0 codebase:
 
 ## All right, brass tacks how strong is she?
 
-Depends. First, her ELO will obviously depend upon which network is used. However, head-to-head using the same network on my limited hardware setup she is currently 50-100 elo behind.
+Depends. First, her ELO will obviously depend upon which network is used. However, head-to-head using the same network on my limited hardware setup she is very competitive with Lc0 and SF.
 
 ## Why did you develop her rather than just help out Leela?
 
-A couple reasons. First, my original inspiration was to see if I could implement an alternative search using AlphaBeta rather than MCTS. Second, I wanted to teach myself the AlphaZero concepts and algorithms and this was the best way to do it. In the future, I expect Allie to have an AB search and leave MCTS to Leela, but it is not ready yet. I've done a lot of experiments with AB and Lc0 networks and think I've hit upon what might work, but getting the NPS to scale and utilizing the policy values optimally is challenging. Stay tuned.
+A couple reasons. First, my original inspiration was to see if I could implement an alternative search using Minimax/AlphaBeta rather than MCTS. Second, I wanted to teach myself the AlphaZero concepts and algorithms and this was the best way to do it. Allie is now using a hybrid Minimax Monte Carlo search.
 
 Also, I am contributing back some patches to Leela where appropriate.
 
@@ -63,3 +63,41 @@ I've set up a patreon page here: https://www.patreon.com/gonzochess75 and would 
 
 Yes, I'd like to wholeheartedly thank the developers of the Lc0 project which make Allie even possible. Only by standing on their shoulders could Allie exist. I'd also like to thank Deepmind for their work on AlphaZero which started the whole NN for chess era. Finally, I'd like to thank Andrew Grant who wrote the Ethereal engine whose code was a big inspiration for writing Allie and to CCC and TCEC for including the engine in their tournaments.
 
+# Quick start guide (Linux)
+
+## Prerequisites
+
+You need:
+
+- working build environment: compiler (e.g., GCC or CLANG), binutils, and the rest of the usual stuff.
+- qmake (part of Qt SDK)
+- CUDA and cuDNN. If you can build and run Lc0 with the cuDNN backend, you're probably good.
+
+## Building
+
+The basic steps:
+
+- `qmake` --- Generates the makefiles. Usually only needed to run once.
+- `make -j` --- Build Allie.
+
+If everything went well, you now have `bin/allie` .
+
+If the build system cannot locate CUDA or you want to use a specific CUDA version, you can use NVCC, CUDA_INC_DIR and CUDA_LIB_DIR. For instance:
+
+  `make -j CUDA_INC_DIR=/opt/cuda-10.1.168/include CUDA_LIB_DIR=/opt/cuda-10.1.168/lib64 NVCC=/opt/cuda-10.1.168/bin/nvcc`
+
+Similarly, you can specify the C++ compiler:
+
+  `make -j CXX=clang++-7`
+
+To clean up all the build temporaries:
+
+  `make clean`
+
+There's also `make distclean` to clean up everything, including the targets and the generated makefiles. You need to re-run `qmake` after this command. If in doubt whether changing compiler/CUDA/whatever is in effect, use `make distclean`.
+
+## Running Allie
+
+- Add the network weights file in the same directory with the Allie binary. Symlink (`ln -s`) can be used
+- Launch `allie`. If everything went well, you'll see "allie" in stylished ASCII art with the version information
+- You should now be ready to use Allie with your favorite UCI-compatible chess GUI.
